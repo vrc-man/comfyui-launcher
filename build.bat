@@ -8,7 +8,7 @@ if not exist "comfyui-launcher-venv\Scripts\pyinstaller.exe" (
     pause
     exit /b 1
 )
-"comfyui-launcher-venv\Scripts\pyinstaller.exe" --onefile --windowed --name comfy_launcher --clean --noconfirm comfy_launcher.py
+"comfyui-launcher-venv\Scripts\pyinstaller.exe" --onefile --windowed --name comfy_launcher --clean --noconfirm --icon "%~dp0comfy_launcher.ico" comfy_launcher.py
 if errorlevel 1 (
     echo [ERROR] build failed
     pause
