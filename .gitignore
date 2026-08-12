@@ -1,0 +1,13 @@
+# 虚拟环境
+comfyui-launcher-venv/
+
+# PyInstaller 构建产物
+build/
+dist/
+*.spec
+__pycache__/
+*.pyc
+
+# 运行时生成（含密钥的配置 / 日志）
+comfy_launcher_config.json
+*.log
