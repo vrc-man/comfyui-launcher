@@ -53,8 +53,8 @@ DEFAULT_CONFIG = {
     "confirm_key": "",
     # 启动器启动后是否自动启动 ComfyUI（true=自动拉起；false=仅启动管理服务，手动点「启动」）
     "auto_start_comfyui": False,
-    # 启动时自动检测更新（可 GUI 勾选）
-    "update": {"auto": True},
+    # 启动时自动检测更新（可 GUI 勾选；默认关闭，仅用「检查更新」按钮手动更新）
+    "update": {"auto": False},
     "comfyui": {
         "comfyui_path": "",
         "python_path": "",
