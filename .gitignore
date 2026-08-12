@@ -11,3 +11,6 @@ __pycache__/
 # 运行时生成（含密钥的配置 / 日志）
 comfy_launcher_config.json
 *.log
+comfy_launcher.lock
+core.py.bak
+core.py.tmp
