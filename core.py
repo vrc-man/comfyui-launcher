@@ -53,6 +53,8 @@ DEFAULT_CONFIG = {
     "confirm_key": "",
     # 启动器启动后是否自动启动 ComfyUI（true=自动拉起；false=仅启动管理服务，手动点「启动」）
     "auto_start_comfyui": False,
+    # 启动时自动检测更新（可 GUI 勾选）
+    "update": {"auto": True},
     "comfyui": {
         "comfyui_path": "",
         "python_path": "",
@@ -539,6 +541,7 @@ def run_gui():
     key_var = tk.StringVar(value=cfg["api_key"])
     ckey_var = tk.StringVar(value=cfg["confirm_key"])
     auto_var = tk.BooleanVar(value=bool(cfg.get("auto_start_comfyui", False)))
+    auto_update_var = tk.BooleanVar(value=bool((cfg.get("update") or {}).get("auto", True)))
 
     def _real_value(s: str) -> str:
         """去掉 placeholder 提示文本，返回真实值。"""
@@ -558,6 +561,8 @@ def run_gui():
         cfg["api_key"] = key_var.get().strip()
         cfg["confirm_key"] = ckey_var.get().strip()
         cfg["auto_start_comfyui"] = bool(auto_var.get())
+        u = cfg.setdefault("update", {})
+        u["auto"] = bool(auto_update_var.get())
         save_config(cfg)
 
     for r in range(2):
@@ -582,6 +587,10 @@ def run_gui():
     tk.Checkbutton(frame, text="自动拉起（否则仅启动管理服务，需手动点「启动」）",
                    variable=auto_var).grid(row=5, column=1, sticky="w", padx=4)
 
+    tk.Label(frame, text="启动自动检测更新:").grid(row=6, column=0, sticky="w", padx=4, pady=3)
+    tk.Checkbutton(frame, text="启动时自动对比版本，有更新则下载并重启（否则仅用「检查更新」按钮手动更新）",
+                   variable=auto_update_var).grid(row=6, column=1, sticky="w", padx=4)
+
     tk.Label(frame, text="API 密钥:").grid(row=3, column=0, sticky="w", padx=4, pady=3)
     e4 = tk.Entry(frame, textvariable=key_var, width=52)
     e4.grid(row=3, column=1, sticky="we", padx=4)
@@ -592,7 +601,7 @@ def run_gui():
     e5.grid(row=4, column=1, sticky="we", padx=4)
     tk.Button(frame, text="生成", command=lambda: ckey_var.set(secrets.token_hex(16))).grid(row=4, column=2, padx=2)
 
-    for var in (comfy_var, py_var, port_var, key_var, ckey_var, auto_var):
+    for var in (comfy_var, py_var, port_var, key_var, ckey_var, auto_var, auto_update_var):
         var.trace_add("write", lambda *a: persist_settings())
     frame.columnconfigure(1, weight=1)
 
