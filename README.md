@@ -40,7 +40,7 @@ comfyui-launcher/
 ├── create_venv.bat          # 创建虚拟环境 + 安装 PyInstaller / FastAPI
 ├── start_launcher.bat       # 源码模式启动
 ├── comfy_launcher.ico       # 应用程序图标（打包用）
-├── congmfyui启动器图标.png   # 图标原图 2048×2048（豆包 AI 生成）
+├── comfyui启动器图标.png    # 图标原图 2048×2048（豆包 AI 生成）
 └── icon_preview.png         # 图标预览 256×256
 ```
 
