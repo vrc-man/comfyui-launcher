@@ -1168,7 +1168,7 @@ def run_gui():
 # 更新机制（由壳 exe 调用；core.py 本身可被热替换）
 # ══════════════════════════════════════════════════════════════
 
-CORE_VERSION = "1.0.6"
+CORE_VERSION = "1.0.7"
 # 更新源：GitHub 直连 + 加速镜像列表 + 仓库地址。version.json 与 core.py 放仓库根目录。
 # 逻辑文件（version.json / core.py）：prefix + /<repo>/<branch>/<file>
 # Release 附件（exe）：prefix + /https://github.com/<repo>/releases/download/<tag>/<name>
@@ -1241,6 +1241,42 @@ def _fetch_version_info(ucfg: dict) -> Optional[dict]:
         if best is None or t > best_t:
             best, best_t = info, t
     return best
+
+
+def _fetch_all_version_info(ucfg: dict) -> list:
+    """把所有源的 version.json 都取回来（按版本号从新到旧），用于「清单↔文件」配对校验。"""
+    out, seen = [], set()
+    for mirror in ucfg["mirrors"]:
+        url = f"{mirror}/{ucfg['repo']}/{ucfg['branch']}/{ucfg['version_file']}"
+        try:
+            info = json.loads(_http_get_bytes(url, int(ucfg.get("timeout", 15))).decode("utf-8-sig"))
+        except Exception:
+            continue
+        if not isinstance(info, dict):
+            continue
+        key = (str(info.get("version", "")), str(info.get("core_sha256", "")).lower())
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(info)
+    out.sort(key=lambda i: _ver_tuple(str(i.get("version", ""))), reverse=True)
+    return out
+
+
+def _download_core_blobs(ucfg: dict) -> list:
+    """从所有源下载 core.py，按内容哈希去重（同一版本可能只在一部分源上已刷新）。"""
+    blobs, seen = [], set()
+    for mirror in ucfg["mirrors"]:
+        url = f"{mirror}/{ucfg['repo']}/{ucfg['branch']}/{ucfg['core_file']}"
+        try:
+            data = _http_get_bytes(url, int(ucfg.get("timeout", 15)))
+        except Exception:
+            continue
+        h = hashlib.sha256(data).hexdigest()
+        if h not in seen:
+            seen.add(h)
+            blobs.append(data)
+    return blobs
 
 
 def _download_core(ucfg: dict) -> Optional[bytes]:
@@ -1401,20 +1437,33 @@ def check_update(verbose: bool = False) -> dict:
 
 
 def apply_update() -> dict:
-    """下载新 core.py → sha256 校验 → .tmp 写入 → os.replace 原子替换 → 备份回滚。
+    """下载新 core.py → 与远端清单配对校验 → 备份 → 原子替换。
 
-    成功返回 {"ok": True, "file": ...}；失败返回 {"ok": False, "error": ...}。
+    关键点：所有源的 version.json 和 core.py 都取一遍，只要能找到「某份清单的哈希
+    等于某份下载内容」的配对就采用。这样即使 raw CDN 上 version.json 还是旧缓存、
+    core.py 已刷新（或反过来），也不会误报「校验失败」——任一源自洽即可完成更新。
     """
     ucfg = _load_update_config(load_config())
-    info = _fetch_version_info(ucfg)
-    if not info:
-        return {"ok": False, "error": "无法获取版本信息"}
-    expected = str(info.get("core_sha256", "")).strip().lower()
-    data = _download_core(ucfg)
-    if data is None:
+    infos = _fetch_all_version_info(ucfg)
+    if not infos:
+        return {"ok": False, "error": "无法获取版本信息（网络或镜像失效）"}
+    blobs = _download_core_blobs(ucfg)
+    if not blobs:
         return {"ok": False, "error": "下载 core.py 失败"}
-    if expected and hashlib.sha256(data).hexdigest().lower() != expected:
-        return {"ok": False, "error": "sha256 校验失败，已拒绝写入（防损坏/篡改）"}
+
+    data, picked_ver = None, ""
+    for blob in blobs:
+        h = hashlib.sha256(blob).hexdigest().lower()
+        for info in infos:                      # infos 已按版本从新到旧
+            if str(info.get("core_sha256", "")).strip().lower() == h:
+                data, picked_ver = blob, str(info.get("version", ""))
+                break
+        if data is not None:
+            break
+    if data is None:
+        return {"ok": False,
+                "error": "远端 version.json 与 core.py 不同步（CDN 缓存未刷新），请稍后重试"}
+
     bak = CORE_PATH.with_suffix(".py.bak")
     tmp = CORE_PATH.with_suffix(".py.tmp")
     try:
@@ -1426,7 +1475,7 @@ def apply_update() -> dict:
         if CORE_PATH.is_file():
             os.replace(CORE_PATH, bak)          # 覆盖式刷新备份（回滚点始终是本机上一版）
         os.replace(tmp, CORE_PATH)              # 原子替换
-        return {"ok": True, "file": str(CORE_PATH), "backup": str(bak)}
+        return {"ok": True, "file": str(CORE_PATH), "backup": str(bak), "version": picked_ver}
     except Exception as e:
         # 回滚：替换失败则恢复备份
         try:
@@ -1529,19 +1578,54 @@ def stage_exe_update(exe_sha: str = "", info: dict = None) -> dict:
     if not exe or not exe.is_file():
         return {"ok": False, "error": "当前是源码模式运行，没有可替换的 exe"}
     ucfg = _load_update_config(load_config())
-    if info is None:
-        info = _fetch_version_info(ucfg)
-    if not info:
+    infos = [info] if info else _fetch_all_version_info(ucfg)
+    if not infos:
         return {"ok": False, "error": "无法获取版本信息"}
-    expected = str(exe_sha or (info.get("exe") or {}).get("sha256", "")).strip().lower()
-    if not expected:
+    if exe_sha:                       # 调用方指定了哈希：只认这一个
+        pairs = [(str(exe_sha).strip().lower(), u)
+                 for u in _exe_download_urls({"exe": (infos[0].get("exe") or {})}, ucfg)]
+        if not pairs:
+            pairs = [(str(exe_sha).strip().lower(), (infos[0].get("exe") or {}).get("url", ""))]
+    else:
+        # 多份清单 × 多个源：把 (期望哈希, 地址) 全部铺开，配对成功即用。
+        # 注意按 (哈希, 地址) 去重而不是只按地址去重：不同清单可能指向同一个地址，
+        # 但期望哈希不同（CDN 缓存新旧不一致），只按地址去重会把能配对的那份丢掉。
+        pairs, seen_pair = [], set()
+        for inf in infos:
+            exe_info = inf.get("exe") or {}
+            sha = str(exe_info.get("sha256", "")).strip().lower()
+            if not sha:
+                continue
+            for u in _exe_download_urls({"exe": exe_info}, ucfg):
+                key = (sha, u)
+                if key in seen_pair:
+                    continue
+                seen_pair.add(key)
+                pairs.append((sha, u))
+    if not pairs:
         return {"ok": False, "error": "远端 version.json 没有提供 exe 哈希，已放弃更新"}
-    data = _download_exe(info, ucfg)
+
+    data, picked_ver = None, ""
+    blobs_by_url = {}                       # 同一地址只下一次，但和所有清单的哈希都比对
+    for sha, url in pairs:
+        if url not in blobs_by_url:
+            try:
+                blobs_by_url[url] = _http_get_bytes(url, max(60, int(ucfg.get("timeout", 15))))
+            except Exception:
+                blobs_by_url[url] = None
+        blob = blobs_by_url[url]
+        if not blob:
+            continue
+        if hashlib.sha256(blob).hexdigest().lower() == sha:
+            data = blob
+            for inf in infos:
+                if str((inf.get("exe") or {}).get("sha256", "")).strip().lower() == sha:
+                    picked_ver = str(inf.get("version", ""))
+                    break
+            break
     if data is None:
-        return {"ok": False, "error": "下载新 exe 失败（所有源均不可用）"}
-    got = hashlib.sha256(data).hexdigest().lower()
-    if got != expected:
-        return {"ok": False, "error": "新 exe 的 sha256 校验失败，已拒绝替换"}
+        return {"ok": False,
+                "error": "下载新 exe 失败，或远端清单与文件不同步（CDN 缓存未刷新），请稍后重试"}
     new = exe.with_name(exe.name + ".new")
     try:
         new.write_bytes(data)
@@ -1550,7 +1634,7 @@ def stage_exe_update(exe_sha: str = "", info: dict = None) -> dict:
             return {"ok": False, "error": "新 exe 写入不完整"}
         script = _swap_script(exe, new)
         return {"ok": True, "new": str(new), "script": str(script),
-                "version": str(info.get("version", "")), "size": len(data)}
+                "version": picked_ver, "size": len(data)}
     except Exception as e:
         return {"ok": False, "error": f"{type(e).__name__}: {e}"}
 
