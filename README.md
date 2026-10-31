@@ -1,8 +1,34 @@
 # ComfyUI 启动器
 
-当前版本 **v1.0.3**（核心逻辑版本见 `core.py` 的 `CORE_VERSION`）。
+当前版本 **v1.0.7**（以仓库根的 `version.json` 为准；核心逻辑版本见 `core.py` 的 `CORE_VERSION`）。
 
-一个带图形界面（GUI）的 ComfyUI 启动/管理工具，内置本地 HTTP 管理服务，可被其他程序远程调用（如网页管理面板），并支持通过 GitHub 镜像热更新核心逻辑。
+一个带图形界面（GUI）的 ComfyUI 启动/管理工具，内置本地 HTTP 管理服务，可被其他程序远程调用（如网页管理面板），并支持通过 GitHub 镜像热更新（核心逻辑与启动器本体都能自更新）。
+
+## 直接使用（不用编译，下载现成的就行）
+
+作者已经在仓库里放好了构建产物，**不需要装 Python、不需要 pip、不需要打包**：
+
+| 下载这两个文件（必需） |
+|---|
+| [`comfy_launcher.exe`](https://raw.githubusercontent.com/vrc-man/comfyui-launcher/main/comfy_launcher.exe) —— 启动器本体，约 17 MB |
+| [`core.py`](https://raw.githubusercontent.com/vrc-man/comfyui-launcher/main/core.py) —— 核心逻辑，壳启动时要加载它 |
+
+可选再下一个 [`version.json`](https://raw.githubusercontent.com/vrc-man/comfyui-launcher/main/version.json)，只是方便肉眼查看当前版本号，不放也能正常用。
+
+步骤：
+
+1. 把 `comfy_launcher.exe` 和 `core.py` 放在**同一个目录**（例如 `D:\ComfyLauncher\`）
+2. 双击 `comfy_launcher.exe`
+3. 在窗口上方「设置」里填两个路径（改完自动保存，下次不用再填）：
+   - **ComfyUI 目录**：包含 `main.py` 的那个目录，例如 `D:\ComfyUI_windows_portable\ComfyUI`
+   - **Python 路径**：便携版一般是 `D:\ComfyUI_windows_portable\python_embeded\python.exe`
+4. 点「🚀 启动」拉起 ComfyUI；之后用「⏹ 停止 / 🔄 重启」管理，日志在下方两个标签页里实时滚动
+
+首次运行会在 exe 同目录自动生成 `comfy_launcher_config.json`（内含随机生成的 API 密钥），**不要删它**——密钥就在里面。
+
+> 提示：ComfyUI 本身不支持含中文或空格的路径，请把它放在纯英文无空格目录（如 `D:\ComfyUI`），否则启动器会直接报错拦住。
+
+想升级时不用重新下载：点窗口里的「📥 检查更新」，核心逻辑和启动器本体都会自动换成最新版（本体更新后会自动重启）。
 
 ## 功能特性
 
@@ -44,19 +70,9 @@ comfyui-launcher/
 └── icon_preview.png         # 图标预览 256×256
 ```
 
-## 使用（分发模式）
-
-把 `comfy_launcher.exe` 和 `core.py` 放在**同一目录**，双击 exe 即可：
-
-1. 在「设置」里填写你的 ComfyUI 目录和 Python 路径
-   - ComfyUI 目录：包含 `main.py` 的目录
-   - Python 路径：通常为 `python_embeded\python.exe`（ComfyUI 便携版）
-2. 点「🚀 启动」拉起 ComfyUI，或点「⏹ 停止 / 🔄 重启」管理
-3. 实时日志在两个标签页分别显示（启动器/API 与 ComfyUI）
-
-> 提示：ComfyUI 不支持含中文或空格的路径，请放在纯英文无空格目录（如 `D:\ComfyUI`）。
-
 ## 开发 / 打包
+
+只改 `core.py` 时不用重新打包（热更新会替换它）；改了 `comfy_launcher.py`（壳）才必须重打包。
 
 ```bat
 :: 首次：创建 venv（用 I:\cc\Py64-311 等 base python）
@@ -125,6 +141,7 @@ gh release create v1.0.5 "dist\comfy_launcher.exe" --title "v1.0.5" --notes "说
 
 | 方法 | 路径 | 说明 | 额外要求 |
 |---|---|---|---|
+| GET | `/api/health` | 健康探针：返回 `pid` / 实例号 / 版本，用于确认端口上跑的是哪个实例 | 无（仅本机） |
 | GET | `/api/status` | 运行状态 / PID / 端口占用 | X-Key |
 | GET | `/api/logs?tail=N&source=launcher\|comfy` | 最近 N 行日志（分来源） | X-Key |
 | POST | `/api/start` | 启动 ComfyUI | X-Key |
