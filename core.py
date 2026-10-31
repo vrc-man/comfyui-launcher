@@ -702,6 +702,10 @@ def run_gui():
     top.pack(fill="x")
     tk.Label(top, textvariable=status_var, font=("Microsoft YaHei UI", 11, "bold"),
              fg="#0a7d32").pack(side="left")
+    # 内核版本：来自 core.py 的 CORE_VERSION（热更新替换 core.py 后，重启即变）
+    tk.Label(top, text=f"内核 v{CORE_VERSION}", font=("Microsoft YaHei UI", 9),
+             fg="#555").pack(side="right")
+    tk.Label(top, text="版本:", font=("Microsoft YaHei UI", 9), fg="#888").pack(side="right")
 
     # ── 路径/端口/密钥设置 ──
     frame = tk.LabelFrame(root, text=" 设置（修改后自动保存） ", padx=8, pady=6,
@@ -1179,10 +1183,16 @@ def run_gui():
     hint.pack(fill="x", padx=10, pady=(0, 6), before=frame)
 
     def refresh_hint():
-        """显示真实生效的管理地址；端口被改过则提示需重启启动器才生效。"""
+        """显示真实生效的管理地址 + 内核/本体标识；端口被改过则提示需重启才生效。"""
         bound = BOUND["port"] or int(cfg["listen_port"])
+        _exe = exe_path()
+        if _exe:
+            _sha = exe_sha256()
+            body = f"本体 {_exe.name} ({_sha[:8]})" if _sha else f"本体 {_exe.name}"
+        else:
+            body = "本体 源码模式"
         txt = (f"管理地址: http://{BOUND['host'] or cfg['listen_host']}:{bound}"
-               "   (仅本机，密钥见上方设置)")
+               f"   |   内核 v{CORE_VERSION}（core.py）   |   {body}")
         try:
             want = int(port_var.get().strip() or "18808")
         except ValueError:
@@ -1214,7 +1224,7 @@ def run_gui():
 # 更新机制（由壳 exe 调用；core.py 本身可被热替换）
 # ══════════════════════════════════════════════════════════════
 
-CORE_VERSION = "1.0.8"
+CORE_VERSION = "1.0.9"
 # 更新源：GitHub 直连 + 加速镜像列表 + 仓库地址。version.json 与 core.py 放仓库根目录。
 # 逻辑文件（version.json / core.py）：prefix + /<repo>/<branch>/<file>
 # Release 附件（exe）：prefix + /https://github.com/<repo>/releases/download/<tag>/<name>

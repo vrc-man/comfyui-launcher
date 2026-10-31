@@ -1,16 +1,22 @@
 @echo off
-rem 打包为单文件 GUI exe -> dist\comfy_launcher.exe
-rem 打包后自动生成 version.json（core.py 哈希 + 版本号），并复制 core.py 到 dist
+rem 一键发布：打包 exe -> 自动递增内核版本 -> 生成 version.json（双哈希）-> 同步 dist 与仓库本体
+rem
+rem 用法：
+rem   build.bat                         直接打包，版本号自动 +1，本体按 raw 方式随仓库提交
+rem   build.bat "更新说明"               同时把说明写进 version.json 的 changelog
+rem   版本号来源：core.py 里的 CORE_VERSION（本脚本会自动把它补丁号 +1）
 chcp 65001 >nul
 cd /d "%~dp0"
-if not exist "comfyui-launcher-venv\Scripts\pyinstaller.exe" (
+
+set "VENV=%~dp0comfyui-launcher-venv"
+if not exist "%VENV%\Scripts\pyinstaller.exe" (
     echo [ERROR] pyinstaller not found, run create_venv.bat first
     pause
     exit /b 1
 )
-rem --collect-submodules：core.py 是运行时 importlib 加载的，PyInstaller 静态分析看不到 uvicorn/fastapi
-rem 内部的动态导入（uvicorn.loops.auto / protocols / lifespan），不显式收集会在 exe 里 ImportError。
-"comfyui-launcher-venv\Scripts\pyinstaller.exe" --onefile --windowed --name comfy_launcher --clean --noconfirm ^
+
+echo [1/3] 打包 exe ...
+"%VENV%\Scripts\pyinstaller.exe" --onefile --windowed --name comfy_launcher --clean --noconfirm ^
   --collect-submodules uvicorn --collect-submodules fastapi --collect-submodules starlette --collect-submodules anyio ^
   --icon "%~dp0comfy_launcher.ico" comfy_launcher.py
 if errorlevel 1 (
@@ -18,17 +24,22 @@ if errorlevel 1 (
     pause
     exit /b 1
 )
-echo [OK] Built: dist\comfy_launcher.exe
+echo [OK] dist\comfy_launcher.exe
 
-rem 生成 version.json（供启动器检测更新）
-"comfyui-launcher-venv\Scripts\python.exe" make_version.py
+echo.
+echo [2/3] 递增版本号并生成 version.json（core.py / exe 双哈希）...
+"%VENV%\Scripts\python.exe" make_version.py --bump --raw --changelog="%~1"
 if errorlevel 1 (
-    echo [WARN] make_version.py failed
+    echo [ERROR] make_version.py failed
+    pause
+    exit /b 1
 )
 
-rem 复制 core.py 到 dist（分发目录 = exe + core.py + version.json）
-copy /Y core.py dist\core.py >nul
-rem 必须每次都覆盖：make_version.py 刚刚重写了 version.json，只在缺失时复制会留下旧哈希（假更新/漏更新）
-copy /Y version.json dist\version.json >nul
-echo [OK] dist 目录: comfy_launcher.exe + core.py + version.json
+echo.
+echo [3/3] 完成。分发目录 dist 内容：
+dir /b dist
+echo.
+echo 接下来手动提交（exe 与 core.py、version.json 必须一起推）：
+echo     git add -A ^&^& git commit -m "release" ^&^& git push origin main
+echo.
 pause

@@ -1,8 +1,8 @@
 {
-  "version": "1.0.8",
-  "core_sha256": "57ca8c0d0e299b25eb14eec81ce469264c361bfda3e79e042f3c74fe201ced8b",
-  "core_size": 79294,
-  "changelog": "更新支持自定义代理：设置里填代理 IP + 端口后，查更新/下载 core.py/下载本体全部走该代理直连 GitHub 官方地址；新增「测试」按钮当场验证代理连通性与耗时；留空则沿用系统代理或直连",
+  "version": "1.0.9",
+  "core_sha256": "261842771b2d3cbcd63c6e8804e7d75151d18b4b91cf09170218698ee9f3e968",
+  "core_size": 79865,
+  "changelog": "GUI 顶栏显示内核版本；build.bat 自动递增版本并重生成 version.json（core+exe 双哈希）并同步 dist 与仓库本体；.bat 转 CRLF 修复 cmd 解析错位",
   "exe": {
     "sha256": "e7de34e698599102d80281041708196f400a91272285e1ed7cc9c57383812f4d",
     "size": 17949694,

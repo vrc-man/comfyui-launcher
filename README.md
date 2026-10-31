@@ -33,6 +33,7 @@
 ## 功能特性
 
 - **图形界面管理**：启动 / 停止 / 重启 ComfyUI，实时查看启动器与 ComfyUI 的双日志
+- **版本可见**：顶栏与状态栏直接显示**内核版本**（`core.py` 里的 `CORE_VERSION`）和本体标识（exe 名 + 哈希前 8 位 / 源码模式），自己跑的是哪版一目了然
 - **启动选项开关**：fp16_accumulation、cuda_malloc、自定义命令、自定义环境变量，逐项独立控制，界面实时显示「实际参数」
 - **本地管理 API**：FastAPI 服务，支持 `status / logs / start / stop / restart`，`X-Key` 密钥鉴权，仅监听 127.0.0.1
 - **三线程分离**：UI / HTTP 服务 / 子进程管理互不阻塞
@@ -78,11 +79,26 @@ comfyui-launcher/
 :: 首次：创建 venv（用 I:\cc\Py64-311 等 base python）
 create_venv.bat
 
-:: 打包 exe + 生成 version.json + 复制 core.py 到 dist
-build.bat
+:: 一条命令搞定：打包 exe -> 内核版本自动 +1 -> 重生成 version.json（core+exe 双哈希）
+::              -> 同步 dist\ 与仓库根的本体
+build.bat "本次更新说明"
 ```
 
+`build.bat` 现在全自动，不需要再手动跑 `make_version.py`：
+
+1. 用 PyInstaller 打包 `dist\comfy_launcher.exe`
+2. 把 `core.py` 的 `CORE_VERSION` **补丁号 +1**（单一版本来源，不用手改两处）
+3. 用新版本号重生成 `version.json`：`core_sha256`、`core_size`、`exe.sha256`、`exe.size`、`changelog`
+4. 把 `dist\comfy_launcher.exe` 同步成仓库根的 `comfy_launcher.exe`（raw 分发用，哈希与实际提交文件一致）
+5. 把 `core.py` / `version.json` 同步回 `dist\`，保证打包目录永远跟仓库一致
+
+> 注意：`build.bat` 会重打包 exe，**哈希必然变**，已发布的用户点更新时会连 17MB 本体一起下。
+> 只改了 `core.py` 想省流量的话，别跑 `build.bat`，直接 `python make_version.py --bump --raw --changelog="说明"`（只重生成清单，不动 exe）。
+
 打包产物在 `dist\`：`comfy_launcher.exe` + `core.py` + `version.json`。
+
+> `.bat` 文件必须是 **CRLF** 行尾，否则 cmd 会解析错位（报 `'et' 不是内部或外部命令` 这类怪错）。
+> 仓库里已用 `.gitattributes` 的 `*.bat -text` 锁住，克隆下来不会被打回 LF。
 
 ## 更新机制
 
@@ -167,6 +183,19 @@ gh release create v1.0.5 "dist\comfy_launcher.exe" --title "v1.0.5" --notes "说
 - **GUI 日志面板**最多保留 4000 行，热更新前会先写 `.tmp` 再原子替换 `core.py`（`core.py.bak` 为回滚点）。
 
 ## 变更记录
+
+### v1.0.9
+
+- GUI 顶栏显示 **内核版本**（`core.py` 的 `CORE_VERSION`），底部状态栏同时给出内核版本与本体标识（`本体 comfy_launcher.exe (哈希前8位)` / `本体 源码模式`）
+- `build.bat` 全自动发版：打包 → 内核版本补丁号 +1 → 重生成 `version.json`（core + exe 双哈希 + changelog）→ 同步 `dist\` 与仓库根本体
+- `make_version.py` 支持显式 flag：`--bump[=patch|minor|major]`、`--raw`、`--changelog=文本`；位置参数老用法仍兼容
+- 修：`.bat` 文件是裸 LF 导致 cmd 解析错位（报 `'et' 不是内部或外部命令`），已全部转 CRLF 并加 `.gitattributes`（`*.bat -text`）锁定
+
+### v1.0.8
+
+- 新增**自定义 HTTP 代理**：设置里填 IP + 端口后，查更新 / 下 `core.py` / 下 exe 全部走该代理直连 GitHub 官方地址
+- 新增「测试」按钮：当场用它拉一次官方 `version.json`，显示耗时与远端版本；不通会明确报错
+- `update.proxy` 留空 = 不强制代理（沿用系统代理/直连），行为与旧版一致；`socks5://` 会提示格式不支持而不是假装成功
 
 ### v1.0.7
 
