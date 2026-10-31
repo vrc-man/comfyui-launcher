@@ -170,23 +170,67 @@ PLACEHOLDER_COMFY = r"例如：D:\ComfyUI_windows_portable\ComfyUI"
 PLACEHOLDER_PY = r"例如：D:\ComfyUI_windows_portable\python_embeded\python.exe"
 
 
+# ComfyUI 输出量大：攒批落盘，别每行 open/write/close（实测 3.7k 行/秒的磁盘开销会拖住读线程）
+_COMFY_BUF = []
+_COMFY_BUF_CHARS = 0
+_COMFY_FLUSH_TS = 0.0
+_COMFY_FLUSH_BYTES = 8192
+_COMFY_FLUSH_SECS = 0.6
+
+
+def _write_comfy_locked():
+    """把 comfy 缓冲刷进文件（调用方必须持有 _log_lock）。"""
+    global _COMFY_BUF, _COMFY_BUF_CHARS, _COMFY_FLUSH_TS
+    if not _COMFY_BUF:
+        _COMFY_FLUSH_TS = time.time()
+        return
+    try:
+        with open(COMFY_LOG_PATH, "a", encoding="utf-8", errors="replace") as f:
+            f.write("".join(_COMFY_BUF))
+    except OSError:
+        pass
+    _COMFY_BUF = []
+    _COMFY_BUF_CHARS = 0
+    _COMFY_FLUSH_TS = time.time()
+
+
+def flush_comfy_log():
+    """外部主动落盘（关闭程序、停止 ComfyUI 时调用）。"""
+    with _log_lock:
+        _write_comfy_locked()
+
+
+def _comfy_flusher():
+    """兜底定时落盘：即使没有新行，最多 0.6 秒后也会写进文件。"""
+    while True:
+        time.sleep(_COMFY_FLUSH_SECS)
+        try:
+            flush_comfy_log()
+        except Exception:
+            pass
+
+
+threading.Thread(target=_comfy_flusher, daemon=True, name="comfy-log-flusher").start()
+
+
 def _log(level, line, source="launcher"):
     """统一日志（默认 launcher 流）。ComfyUI 输出用 _log(..., source="comfy")。
 
     两条独立流：
       - launcher：启动器自身 + API 操作记录 -> LOG_RING + comfy_launcher.log
-      - comfy   ：ComfyUI 子进程 stdout/stderr -> COMFY_RING + comfyui.log
+      - comfy   ：ComfyUI 子进程 stdout/stderr -> COMFY_RING + comfyui.log（攒批写）
     """
+    global _COMFY_BUF_CHARS
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     entry = f"[{ts}] [{level}] {line}"
     with _log_lock:
         if source == "comfy":
             COMFY_RING.append(entry)
-            try:
-                with open(COMFY_LOG_PATH, "a", encoding="utf-8", errors="replace") as f:
-                    f.write(entry + "\n")
-            except OSError:
-                pass
+            _COMFY_BUF.append(entry + "\n")
+            _COMFY_BUF_CHARS += len(entry) + 1
+            if (_COMFY_BUF_CHARS >= _COMFY_FLUSH_BYTES
+                    or (time.time() - _COMFY_FLUSH_TS) >= _COMFY_FLUSH_SECS):
+                _write_comfy_locked()
         else:
             LOG_RING.append(entry)
             try:
@@ -947,6 +991,8 @@ def run_gui():
     log_nb = ttk.Notebook(log_frame)
     log_nb.pack(fill="both", expand=True)
 
+    LOG_TAGS = {"INFO": "#ffffff", "COMFY": "#ffffff", "WARN": "#ffcc00", "ERROR": "#ff6666"}
+
     def _make_log_page():
         page = tk.Frame(log_nb, bg="#1e1e1e")
         text = scrolledtext.ScrolledText(
@@ -954,6 +1000,10 @@ def run_gui():
             bg="#1e1e1e", fg="#d4d4d4", insertbackground="#d4d4d4",
         )
         text.pack(fill="both", expand=True)
+        # tag 只配置一次。旧实现每插一行就 tag_config → tkinter 会把该 tag
+        # 重新应用到全文，复杂度 O(n²)：1500 行要 23 秒（65 行/秒），界面就是这么卡的。
+        for name, color in LOG_TAGS.items():
+            text.tag_config(name, foreground=color)
         return page, text
 
     launcher_page, launcher_text = _make_log_page()
@@ -964,6 +1014,7 @@ def run_gui():
     def do_clear_logs():
         """清空两个日志页签 + 环形缓冲 + 日志文件（清完留一行提示）。"""
         for t in (launcher_text, comfy_text):
+            _log_lines[id(t)] = 0
             try:
                 t.configure(state="normal")
                 t.delete("1.0", "end")
@@ -994,23 +1045,56 @@ def run_gui():
 
     MAX_LOG_LINES = 4000   # 单个日志面板最多保留行数，防止长时间运行后 Tk 文本控件吃满内存
 
+    _log_lines = {id(launcher_text): 0, id(comfy_text): 0}   # 增量行数，避免每次 index() 解析
+
     def _append_to(text, level, line):
-        tag = "INFO" if level in ("INFO", "COMFY") else ("WARN" if level == "WARN" else "ERROR")
+        """单行追加（低频用，如「日志已清空」提示）。高频路径走 pump_logs 的批量插入。"""
+        tag = level if level in LOG_TAGS else "INFO"
         text.configure(state="normal")
         text.insert("end", line + "\n", tag)
-        text.tag_config(tag, foreground="#ffffff" if level == "COMFY" else (
-            "#ffcc00" if level == "WARN" else "#ff6666"))
-        try:
-            n = int(text.index("end-1c").split(".")[0])
-            if n > MAX_LOG_LINES:
-                text.delete("1.0", f"{n - MAX_LOG_LINES + 1}.0")
-        except Exception:
-            pass
+        _log_lines[id(text)] = _log_lines.get(id(text), 0) + 1
+        if _log_lines[id(text)] > MAX_LOG_LINES:
+            text.delete("1.0", f"{MAX_LOG_LINES + 1}.0")
+            _log_lines[id(text)] = MAX_LOG_LINES
         text.see("end")
         text.configure(state="disabled")
 
     def _append(level, line, source="launcher"):
         _append_to(launcher_text if source == "launcher" else comfy_text, level, line)
+
+    def _append_batch(text, items):
+        """批量追加：一次 insert 写完，再按行 tag_add；只有用户贴着底部时才自动滚动。
+
+        items: [(level, line), ...]，保持原有时间顺序。
+        """
+        if not items:
+            return
+        try:
+            at_bottom = text.yview()[1] > 0.98
+        except Exception:
+            at_bottom = True
+        text.configure(state="normal")
+        start = text.index("end-1c")            # "行.列"
+        start_line = int(start.split(".")[0])
+        chunk = ""
+        spans = []                               # (tag, 起始偏移, 结束偏移)
+        for level, line in items:
+            tag = level if level in LOG_TAGS else "INFO"
+            s = len(chunk)
+            chunk += line + "\n"
+            spans.append((tag, s, len(chunk)))
+        text.insert("end", chunk)
+        for tag, s, e in spans:
+            text.tag_add(tag, f"{start_line}.0 + {s}c", f"{start_line}.0 + {e}c")
+        total = _log_lines.get(id(text), 0) + len(items)
+        if total > MAX_LOG_LINES:
+            drop = total - MAX_LOG_LINES
+            text.delete("1.0", f"{drop + 1}.0")
+            total = MAX_LOG_LINES
+        _log_lines[id(text)] = total
+        if at_bottom:
+            text.see("end")
+        text.configure(state="disabled")
 
     # ── 线程安全 UI 队列 ──
     # tkinter 只能在主线程操作：worker 线程里直接 root.after(...) 会抛
@@ -1034,16 +1118,22 @@ def run_gui():
         root.after(50, pump_ui)
 
     def pump_logs():
-        while True:
-            try:
+        """每 120ms 批量取一次队列，一次 insert 写完（旧实现逐行插 + 每行 see/tag → 卡顿）。"""
+        batch_l, batch_c = [], []
+        try:
+            for _ in range(600):             # 单次最多处理 600 行，避免一帧里干太久
                 ts, source, level, line = LOG_QUEUE.get_nowait()
-            except queue.Empty:
-                break
-            if source == "comfy":
-                _append_to(comfy_text, level, line)
-            else:
-                _append_to(launcher_text, level, line)
-        root.after(200, pump_logs)
+                if source == "comfy":
+                    batch_c.append((level, line))
+                else:
+                    batch_l.append((level, line))
+        except queue.Empty:
+            pass
+        if batch_l:
+            _append_batch(launcher_text, batch_l)
+        if batch_c:
+            _append_batch(comfy_text, batch_c)
+        root.after(120, pump_logs)
 
     # ── 按钮区 ──
     btn_frame = tk.Frame(root, padx=10, pady=8)
@@ -1375,6 +1465,7 @@ def run_gui():
         root.after(1000, refresh_hint)
 
     def _on_close():
+        flush_comfy_log()
         if _persist_job["id"] is not None:
             try:
                 root.after_cancel(_persist_job["id"])
@@ -1397,7 +1488,7 @@ def run_gui():
 # 更新机制（由壳 exe 调用；core.py 本身可被热替换）
 # ══════════════════════════════════════════════════════════════
 
-CORE_VERSION = "1.0.11"
+CORE_VERSION = "1.0.12"
 # 更新源：GitHub 直连 + 加速镜像列表 + 仓库地址。version.json 与 core.py 放仓库根目录。
 # 逻辑文件（version.json / core.py）：prefix + /<repo>/<branch>/<file>
 # Release 附件（exe）：prefix + /https://github.com/<repo>/releases/download/<tag>/<name>
@@ -2050,6 +2141,7 @@ def main():
     if sys.stderr is None:
         sys.stderr = open(os.devnull, "w", encoding="utf-8", errors="replace")
     cleanup_update_leftovers()      # 清掉上一轮 exe 自更新的残留文件
+    threading.Thread(target=exe_sha256, daemon=True).start()   # 预热本体哈希，别卡首帧 UI
     cfg = load_config()
     start_http_server(cfg)
     _log("INFO", f"启动器版本 {CORE_VERSION}，PID={os.getpid()}")
