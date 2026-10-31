@@ -1,8 +1,8 @@
 {
-  "version": "1.0.5",
-  "core_sha256": "1dc7550bfbd5ef36dbff405952d3930889aa0bbc8539a31cdaede79f4e6dbc2c",
-  "core_size": 69653,
-  "changelog": "启动器本体自更新（老版本点检查更新即提示并替换 exe）；启动选项四项开关（fp16_accumulation / cuda_malloc / 自定义命令 / 自定义环境变量）；cuda_malloc 关闭改为 --disable-cuda-malloc；更新源增加 GitHub 直连；修复托管参数去重、配置原子写、单实例锁、热更新替换顺序、镜像前缀、分离脚本挂死等问题",
+  "version": "1.0.6",
+  "core_sha256": "6e3812bdeb35e135f094f534a0bf197f67bfd1886e5762d01e87cd08e34a62fe",
+  "core_size": 70161,
+  "changelog": "修复版本清单缓存导致的误判「已是最新」：拉取时同时询问 GitHub 直连与两个镜像，取版本号最高的清单",
   "exe": {
     "sha256": "e7de34e698599102d80281041708196f400a91272285e1ed7cc9c57383812f4d",
     "size": 17949694,

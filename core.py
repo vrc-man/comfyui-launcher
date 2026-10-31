@@ -1168,7 +1168,7 @@ def run_gui():
 # 更新机制（由壳 exe 调用；core.py 本身可被热替换）
 # ══════════════════════════════════════════════════════════════
 
-CORE_VERSION = "1.0.5"
+CORE_VERSION = "1.0.6"
 # 更新源：GitHub 直连 + 加速镜像列表 + 仓库地址。version.json 与 core.py 放仓库根目录。
 # 逻辑文件（version.json / core.py）：prefix + /<repo>/<branch>/<file>
 # Release 附件（exe）：prefix + /https://github.com/<repo>/releases/download/<tag>/<name>
@@ -1222,14 +1222,25 @@ def _http_get_bytes(url: str, timeout: int) -> Optional[bytes]:
 
 
 def _fetch_version_info(ucfg: dict) -> Optional[dict]:
+    """拉 version.json：把所有源都问一遍，取版本号最高的那份。
+
+    原因：raw.githubusercontent.com 有 CDN 缓存（刚发版可能仍返回旧清单），
+    旧实现只要第一个源成功就返回，用户会误判「已是最新」并持续几分钟。
+    """
+    best, best_t = None, ()
     for mirror in ucfg["mirrors"]:
         url = f"{mirror}/{ucfg['repo']}/{ucfg['branch']}/{ucfg['version_file']}"
         try:
             data = _http_get_bytes(url, int(ucfg.get("timeout", 15)))
-            return json.loads(data.decode("utf-8-sig"))
+            info = json.loads(data.decode("utf-8-sig"))
         except Exception:
             continue
-    return None
+        if not isinstance(info, dict):
+            continue
+        t = _ver_tuple(str(info.get("version", "")))
+        if best is None or t > best_t:
+            best, best_t = info, t
+    return best
 
 
 def _download_core(ucfg: dict) -> Optional[bytes]:
