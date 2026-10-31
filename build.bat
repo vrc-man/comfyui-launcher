@@ -8,7 +8,11 @@ if not exist "comfyui-launcher-venv\Scripts\pyinstaller.exe" (
     pause
     exit /b 1
 )
-"comfyui-launcher-venv\Scripts\pyinstaller.exe" --onefile --windowed --name comfy_launcher --clean --noconfirm --icon "%~dp0comfy_launcher.ico" comfy_launcher.py
+rem --collect-submodules：core.py 是运行时 importlib 加载的，PyInstaller 静态分析看不到 uvicorn/fastapi
+rem 内部的动态导入（uvicorn.loops.auto / protocols / lifespan），不显式收集会在 exe 里 ImportError。
+"comfyui-launcher-venv\Scripts\pyinstaller.exe" --onefile --windowed --name comfy_launcher --clean --noconfirm ^
+  --collect-submodules uvicorn --collect-submodules fastapi --collect-submodules starlette --collect-submodules anyio ^
+  --icon "%~dp0comfy_launcher.ico" comfy_launcher.py
 if errorlevel 1 (
     echo [ERROR] build failed
     pause
@@ -24,8 +28,7 @@ if errorlevel 1 (
 
 rem 复制 core.py 到 dist（分发目录 = exe + core.py + version.json）
 copy /Y core.py dist\core.py >nul
-if not exist "dist\version.json" (
-    copy /Y version.json dist\version.json >nul
-)
+rem 必须每次都覆盖：make_version.py 刚刚重写了 version.json，只在缺失时复制会留下旧哈希（假更新/漏更新）
+copy /Y version.json dist\version.json >nul
 echo [OK] dist 目录: comfy_launcher.exe + core.py + version.json
 pause

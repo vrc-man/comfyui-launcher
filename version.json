@@ -1,6 +1,11 @@
 {
-  "version": "1.0.1",
-  "core_sha256": "382f735fc219530f73228ef40651d9640ddc6ee72f1d5d75f775ab42132a2c52",
-  "core_size": 39787,
-  "changelog": ""
+  "version": "1.0.5",
+  "core_sha256": "1dc7550bfbd5ef36dbff405952d3930889aa0bbc8539a31cdaede79f4e6dbc2c",
+  "core_size": 69653,
+  "changelog": "启动器本体自更新（老版本点检查更新即提示并替换 exe）；启动选项四项开关（fp16_accumulation / cuda_malloc / 自定义命令 / 自定义环境变量）；cuda_malloc 关闭改为 --disable-cuda-malloc；更新源增加 GitHub 直连；修复托管参数去重、配置原子写、单实例锁、热更新替换顺序、镜像前缀、分离脚本挂死等问题",
+  "exe": {
+    "sha256": "e7de34e698599102d80281041708196f400a91272285e1ed7cc9c57383812f4d",
+    "size": 17949694,
+    "url": "https://raw.githubusercontent.com/vrc-man/comfyui-launcher/main/comfy_launcher.exe"
+  }
 }

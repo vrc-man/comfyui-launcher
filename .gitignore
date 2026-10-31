@@ -14,3 +14,9 @@ comfy_launcher_config.json
 comfy_launcher.lock
 core.py.bak
 core.py.tmp
+comfy_launcher_config.json.tmp
+
+# exe 自更新过程中的临时文件（替换脚本/新旧副本），不该进仓库
+comfy_launcher.exe.old
+comfy_launcher.exe.new
+_comfy_launcher_update.cmd

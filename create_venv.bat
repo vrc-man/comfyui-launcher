@@ -20,5 +20,12 @@ if errorlevel 1 (
     pause
     exit /b 1
 )
-echo [OK] venv + pyinstaller ready
+rem core.py 运行期依赖 FastAPI + uvicorn（缺了会在启动时 SystemExit）
+"%~dp0comfyui-launcher-venv\Scripts\pip.exe" install fastapi "uvicorn[standard]"
+if errorlevel 1 (
+    echo [ERROR] fastapi/uvicorn install failed
+    pause
+    exit /b 1
+)
+echo [OK] venv + pyinstaller + fastapi/uvicorn ready
 pause

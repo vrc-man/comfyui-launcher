@@ -34,16 +34,20 @@ import hashlib           # noqa: F401
 import threading         # noqa: F401
 import subprocess        # noqa: F401
 import http.server       # noqa: F401
+import re                # noqa: F401
 import urllib.request    # noqa: F401
 from typing import Optional   # noqa: F401
 from collections import deque  # noqa: F401
 from datetime import datetime  # noqa: F401
 import tkinter as tk            # noqa: F401
 from tkinter import ttk, scrolledtext, filedialog, messagebox  # noqa: F401
-import fastapi                  # noqa: F401
-from fastapi import Header, HTTPException, Query  # noqa: F401
-from fastapi.responses import JSONResponse  # noqa: F401
-import uvicorn                   # noqa: F401
+try:                              # 依赖缺失时交给 core.py 给出中文提示，壳不先崩
+    import fastapi                  # noqa: F401
+    from fastapi import Header, HTTPException, Query  # noqa: F401
+    from fastapi.responses import JSONResponse  # noqa: F401
+    import uvicorn                   # noqa: F401
+except ImportError:
+    pass
 
 if getattr(sys, "frozen", False):
     BASE_DIR = Path(sys.executable).resolve().parent
@@ -52,9 +56,11 @@ else:
 
 CORE_PATH = BASE_DIR / "core.py"
 LOCK_PATH = BASE_DIR / "comfy_launcher.lock"
+_LOCK_FH = None          # 单实例锁句柄（必须常驻，否则锁随 GC 释放）
 
-# 自动更新：启动时检查一次（可在 comfy_launcher_config.json 配置 update.auto 关闭）
-AUTO_UPDATE_DEFAULT = True
+# 自动更新：启动时检查一次（可在 comfy_launcher_config.json 配置 update.auto 开启）
+# 与 README/GUI 一致：默认关闭，只能用「检查更新」按钮手动更新。
+AUTO_UPDATE_DEFAULT = False
 
 
 def _load_core():
@@ -68,11 +74,17 @@ def _load_core():
 
 
 def _acquire_single_instance() -> None:
-    """单实例锁：用 msvcrt 锁定锁文件，抢不到则提示并退出。"""
+    """单实例锁：用 msvcrt 锁定锁文件，抢不到则提示并退出。
+
+    注意：文件句柄必须挂在模块级全局变量上。旧实现把 fh 留在局部变量里，
+    函数返回后 CPython 立刻回收 -> 文件关闭 -> 锁释放，多开完全不受限。
+    """
+    global _LOCK_FH
     try:
         fh = open(LOCK_PATH, "a+")
         try:
             msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+            _LOCK_FH = fh          # 进程存活期间持有，退出时由 OS 释放
         except OSError:
             fh.close()
             try:
@@ -90,26 +102,27 @@ def _acquire_single_instance() -> None:
 
 
 def _auto_update_if_needed(core) -> bool:
-    """启动时自动检测更新。返回 True 表示已触发更新（进程将重启，本函数后应退出）。"""
+    """启动时自动检测更新。返回 True 表示已触发更新（进程将重启/退出）。
+
+    更新分两条通道，全部交给 core.run_startup_update() 处理：
+      - core.py 热更新（替换文件后重启）
+      - 启动器本体 exe 更新（后台脚本等本进程退出后换文件再拉起）
+    """
     try:
-        cfg = json.loads(CORE_PATH.with_name("comfy_launcher_config.json").read_text(encoding="utf-8"))
-        auto = cfg.get("update", {}).get("auto", AUTO_UPDATE_DEFAULT)
+        # utf-8-sig：配置被记事本保存成带 BOM 的 UTF-8 时不至于解析失败
+        cfg = json.loads(CORE_PATH.with_name("comfy_launcher_config.json")
+                         .read_text(encoding="utf-8-sig"))
+        auto = bool(cfg.get("update", {}).get("auto", AUTO_UPDATE_DEFAULT))
     except Exception:
         auto = AUTO_UPDATE_DEFAULT
     if not auto:
         return False
     try:
-        st = core.check_update()
-        if not st.get("ok") or not st.get("has_update"):
-            return False
-        # 有更新：下载替换 + 自动重启
-        r = core.apply_update()
-        if r.get("ok"):
-            core.restart_self()   # 会 os._exit(0)
-            return True
+        return bool(core.run_startup_update())
+    except SystemExit:
+        return True          # 更新流程里可能直接退出进程
     except Exception:
-        pass
-    return False
+        return False
 
 
 def main():
