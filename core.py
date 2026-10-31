@@ -752,6 +752,13 @@ def run_gui():
     ckey_var = tk.StringVar(value=cfg["confirm_key"])
     auto_var = tk.BooleanVar(value=bool(cfg.get("auto_start_comfyui", False)))
     auto_update_var = tk.BooleanVar(value=bool((cfg.get("update") or {}).get("auto", False)))
+    # 更新代理（留空 = 直连 / 走系统代理）
+    _proxy_raw = str((cfg.get("update") or {}).get("proxy") or "")
+    _proxy_norm = normalize_proxy(_proxy_raw) or ""
+    _proxy_hp = _proxy_norm.split("://", 1)[1] if "://" in _proxy_norm else ""
+    _proxy_host, _, _proxy_port = _proxy_hp.rpartition(":") if _proxy_hp else ("", "", "")
+    proxy_host_var = tk.StringVar(value=_proxy_host)
+    proxy_port_var = tk.StringVar(value=_proxy_port)
     # ── 启动可选项 ──
     fp16_var = tk.BooleanVar(value=bool(cfg["comfyui"].get("use_fp16_accumulation", True)))
     cuda_var = tk.BooleanVar(value=bool(cfg["comfyui"].get("use_cuda_malloc", True)))
@@ -790,6 +797,9 @@ def run_gui():
             pass
         u = cfg.setdefault("update", {})
         u["auto"] = bool(auto_update_var.get())
+        _ph = proxy_host_var.get().strip()
+        _pp = proxy_port_var.get().strip()
+        u["proxy"] = f"{_ph}:{_pp}" if (_ph and _pp) else ""
         save_config(cfg)
 
     _persist_job = {"id": None}
@@ -833,6 +843,19 @@ def run_gui():
     tk.Checkbutton(frame, text="启动时自动对比版本，有更新则下载并重启（否则仅用「检查更新」按钮手动更新）",
                    variable=auto_update_var).grid(row=6, column=1, sticky="w", padx=4)
 
+    # ── 更新代理（可选）──
+    tk.Label(frame, text="更新代理:").grid(row=7, column=0, sticky="w", padx=4, pady=3)
+    proxy_box = tk.Frame(frame)
+    proxy_box.grid(row=7, column=1, sticky="w", padx=4)
+    tk.Entry(proxy_box, textvariable=proxy_host_var, width=18).pack(side="left")
+    tk.Label(proxy_box, text=" : ").pack(side="left")
+    tk.Entry(proxy_box, textvariable=proxy_port_var, width=7).pack(side="left")
+    tk.Button(frame, text="测试", command=lambda: do_test_proxy()).grid(row=7, column=2, padx=2)
+    tk.Label(frame,
+             text="填 http 代理（Clash/V2Ray 的混合端口，如 127.0.0.1:7890）；留空=直连或走系统代理。"
+                  "填了之后更新会走代理直连 GitHub 官方地址",
+             fg="#888", font=("Microsoft YaHei UI", 8)).grid(row=8, column=1, sticky="w", padx=4)
+
     tk.Label(frame, text="API 密钥:").grid(row=3, column=0, sticky="w", padx=4, pady=3)
     e4 = tk.Entry(frame, textvariable=key_var, width=52)
     e4.grid(row=3, column=1, sticky="we", padx=4)
@@ -843,7 +866,8 @@ def run_gui():
     e5.grid(row=4, column=1, sticky="we", padx=4)
     tk.Button(frame, text="生成", command=lambda: ckey_var.set(secrets.token_hex(16))).grid(row=4, column=2, padx=2)
 
-    for var in (comfy_var, py_var, port_var, key_var, ckey_var, auto_var, auto_update_var):
+    for var in (comfy_var, py_var, port_var, key_var, ckey_var, auto_var, auto_update_var,
+                proxy_host_var, proxy_port_var):
         var.trace_add("write", schedule_persist)
     frame.columnconfigure(1, weight=1)
 
@@ -1067,6 +1091,28 @@ def run_gui():
         else:
             root.after(0, lambda: _append("INFO", f"✓ {r.get('message')}"))
 
+    def do_test_proxy():
+        """测试代理能否拉到 GitHub 官方清单（不写配置，纯探测）。"""
+        host_txt = proxy_host_var.get().strip()
+        port_txt = proxy_port_var.get().strip()
+        spec = f"{host_txt}:{port_txt}" if (host_txt and port_txt) else ""
+
+        def _worker():
+            r = probe_network(spec)
+            if r.get("ok"):
+                msg = (f"连通正常\n\n代理: {r.get('proxy') or '未使用（直连 / 系统代理）'}\n"
+                       f"远端版本: v{r.get('version')}\n耗时: {r.get('ms')} ms")
+                root.after(0, lambda: _append("INFO", f"✓ 网络测试通过 {r.get('ms')}ms  v{r.get('version')}"
+                                                       f"（代理: {r.get('proxy') or '直连'}）"))
+                root.after(0, lambda: messagebox.showinfo("网络测试", msg))
+            else:
+                msg = (f"拉取失败\n\n代理: {r.get('proxy') or '未使用（直连 / 系统代理）'}\n"
+                       f"地址: {r.get('url')}\n错误: {r.get('error')}")
+                root.after(0, lambda: _append("WARN", f"⚠ 网络测试失败: {r.get('error')}"))
+                root.after(0, lambda: messagebox.showerror("网络测试", msg))
+
+        _run_in_thread(_worker)
+
     def do_check_update():
         def _worker():
             try:
@@ -1168,7 +1214,7 @@ def run_gui():
 # 更新机制（由壳 exe 调用；core.py 本身可被热替换）
 # ══════════════════════════════════════════════════════════════
 
-CORE_VERSION = "1.0.7"
+CORE_VERSION = "1.0.8"
 # 更新源：GitHub 直连 + 加速镜像列表 + 仓库地址。version.json 与 core.py 放仓库根目录。
 # 逻辑文件（version.json / core.py）：prefix + /<repo>/<branch>/<file>
 # Release 附件（exe）：prefix + /https://github.com/<repo>/releases/download/<tag>/<name>
@@ -1192,7 +1238,7 @@ _EXE_HASH = {"path": "", "sha": ""}
 
 
 def _load_update_config(cfg: dict) -> dict:
-    """合并用户配置覆盖：config.json 里可写 update.mirrors/repo/branch 覆盖默认。"""
+    """合并用户配置覆盖：config.json 里可写 update.mirrors/repo/branch/proxy 覆盖默认。"""
     u = cfg.get("update") or {}
     merged = json.loads(json.dumps(UPDATE_CONFIG))
     if u.get("mirrors"):
@@ -1200,7 +1246,34 @@ def _load_update_config(cfg: dict) -> dict:
     for k in ("repo", "branch", "version_file", "core_file", "timeout"):
         if u.get(k) is not None:
             merged[k] = u[k]
+    merged["proxy"] = normalize_proxy(u.get("proxy")) or ""
     return merged
+
+
+def normalize_proxy(value) -> str:
+    """把用户填的代理整理成 http://host:port。
+
+    支持：`127.0.0.1:7890`、`http://127.0.0.1:7890`、`https://host:port`、`host`（默认 8080 不管）。
+    socks5 需要 PySocks，这里不静默失败，返回空串由调用方给出提示。
+    """
+    s = str(value or "").strip()
+    if not s:
+        return ""
+    low = s.lower()
+    if low.startswith(("socks5://", "socks4://", "socks://")):
+        return ""                      # urllib 不原生支持 socks，别假装能用
+    if "://" not in s:
+        s = "http://" + s
+    scheme, _, rest = s.partition("://")
+    if scheme.lower() not in ("http", "https"):
+        return ""
+    rest = rest.strip("/")
+    if not rest or ":" not in rest:
+        return ""
+    host, _, port = rest.rpartition(":")
+    if not host or not port.isdigit() or not (0 < int(port) < 65536):
+        return ""
+    return f"{scheme.lower()}://{host}:{port}"
 
 
 def _sha256_file(path) -> str:
@@ -1214,9 +1287,15 @@ def _sha256_file(path) -> str:
     return h.hexdigest()
 
 
-def _http_get_bytes(url: str, timeout: int) -> Optional[bytes]:
+def _http_get_bytes(url: str, timeout: int, proxy: str = "") -> Optional[bytes]:
+    """HTTP(S) 取字节。proxy 为空时走系统默认（与原行为一致）；填了就强制走该代理。"""
     import urllib.request
     req = urllib.request.Request(url, headers={"User-Agent": "comfyui-launcher/updater"})
+    if proxy:
+        opener = urllib.request.build_opener(
+            urllib.request.ProxyHandler({"http": proxy, "https": proxy}))
+        with opener.open(req, timeout=timeout) as r:
+            return r.read()
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return r.read()
 
@@ -1231,7 +1310,7 @@ def _fetch_version_info(ucfg: dict) -> Optional[dict]:
     for mirror in ucfg["mirrors"]:
         url = f"{mirror}/{ucfg['repo']}/{ucfg['branch']}/{ucfg['version_file']}"
         try:
-            data = _http_get_bytes(url, int(ucfg.get("timeout", 15)))
+            data = _http_get_bytes(url, int(ucfg.get("timeout", 15)), ucfg.get("proxy", ""))
             info = json.loads(data.decode("utf-8-sig"))
         except Exception:
             continue
@@ -1249,7 +1328,7 @@ def _fetch_all_version_info(ucfg: dict) -> list:
     for mirror in ucfg["mirrors"]:
         url = f"{mirror}/{ucfg['repo']}/{ucfg['branch']}/{ucfg['version_file']}"
         try:
-            info = json.loads(_http_get_bytes(url, int(ucfg.get("timeout", 15))).decode("utf-8-sig"))
+            info = json.loads(_http_get_bytes(url, int(ucfg.get("timeout", 15)), ucfg.get("proxy", "")).decode("utf-8-sig"))
         except Exception:
             continue
         if not isinstance(info, dict):
@@ -1269,7 +1348,7 @@ def _download_core_blobs(ucfg: dict) -> list:
     for mirror in ucfg["mirrors"]:
         url = f"{mirror}/{ucfg['repo']}/{ucfg['branch']}/{ucfg['core_file']}"
         try:
-            data = _http_get_bytes(url, int(ucfg.get("timeout", 15)))
+            data = _http_get_bytes(url, int(ucfg.get("timeout", 15)), ucfg.get("proxy", ""))
         except Exception:
             continue
         h = hashlib.sha256(data).hexdigest()
@@ -1283,7 +1362,7 @@ def _download_core(ucfg: dict) -> Optional[bytes]:
     for mirror in ucfg["mirrors"]:
         url = f"{mirror}/{ucfg['repo']}/{ucfg['branch']}/{ucfg['core_file']}"
         try:
-            return _http_get_bytes(url, int(ucfg.get("timeout", 15)))
+            return _http_get_bytes(url, int(ucfg.get("timeout", 15)), ucfg.get("proxy", ""))
         except Exception:
             continue
     return None
@@ -1378,10 +1457,35 @@ def _exe_download_urls(info: dict, ucfg: dict) -> list:
 def _download_exe(info: dict, ucfg: dict) -> Optional[bytes]:
     for url in _exe_download_urls(info, ucfg):
         try:
-            return _http_get_bytes(url, max(60, int(ucfg.get("timeout", 15))))
+            return _http_get_bytes(url, max(60, int(ucfg.get("timeout", 15))), ucfg.get("proxy", ""))
         except Exception:
             continue
     return None
+
+
+def probe_network(proxy: str = "") -> dict:
+    """测试更新源连通性（走 GitHub 官方 raw 地址），给 GUI「测试」按钮用。
+
+    proxy 传 None 表示用配置里的值；传 "" 表示强制直连/系统代理；传 host:port 表示测试该代理。
+    """
+    ucfg = _load_update_config(load_config())
+    if proxy is None:
+        p = ucfg.get("proxy", "")
+    else:
+        raw = str(proxy or "").strip()
+        p = normalize_proxy(raw) if raw else ""
+        if raw and not p:
+            return {"ok": False, "error": "代理格式不对，应形如 127.0.0.1:7890", "proxy": ""}
+    url = f"{RAW_BASE}/{ucfg['repo']}/{ucfg['branch']}/{ucfg['version_file']}"
+    t0 = time.time()
+    try:
+        data = _http_get_bytes(url, 8, p)
+        info = json.loads(data.decode("utf-8-sig"))
+        return {"ok": True, "ms": int((time.time() - t0) * 1000),
+                "version": str(info.get("version", "")), "proxy": p, "url": url}
+    except Exception as e:
+        return {"ok": False, "ms": int((time.time() - t0) * 1000), "proxy": p, "url": url,
+                "error": f"{type(e).__name__}: {e}"}
 
 
 def check_update(verbose: bool = False) -> dict:
@@ -1610,7 +1714,7 @@ def stage_exe_update(exe_sha: str = "", info: dict = None) -> dict:
     for sha, url in pairs:
         if url not in blobs_by_url:
             try:
-                blobs_by_url[url] = _http_get_bytes(url, max(60, int(ucfg.get("timeout", 15))))
+                blobs_by_url[url] = _http_get_bytes(url, max(60, int(ucfg.get("timeout", 15))), ucfg.get("proxy", ""))
             except Exception:
                 blobs_by_url[url] = None
         blob = blobs_by_url[url]
