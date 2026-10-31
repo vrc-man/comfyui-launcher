@@ -940,6 +940,10 @@ def run_gui():
     log_frame = tk.LabelFrame(root, text=" 实时日志 ", padx=4, pady=4, font=("Microsoft YaHei UI", 9))
     log_frame.pack(fill="both", expand=True, padx=10, pady=4)
 
+    # 日志工具条（右上角）：清空当前显示 + 环形缓冲 + 日志文件
+    log_tools = tk.Frame(log_frame)
+    log_tools.pack(fill="x", pady=(0, 2))
+
     log_nb = ttk.Notebook(log_frame)
     log_nb.pack(fill="both", expand=True)
 
@@ -956,6 +960,37 @@ def run_gui():
     comfy_page, comfy_text = _make_log_page()
     log_nb.add(launcher_page, text=" 启动器 / API ")
     log_nb.add(comfy_page, text="  ComfyUI  ")
+
+    def do_clear_logs():
+        """清空两个日志页签 + 环形缓冲 + 日志文件（清完留一行提示）。"""
+        for t in (launcher_text, comfy_text):
+            try:
+                t.configure(state="normal")
+                t.delete("1.0", "end")
+                t.configure(state="disabled")
+            except Exception:
+                pass
+        with _log_lock:
+            LOG_RING.clear()
+            COMFY_RING.clear()
+        # 队列里可能还有没泵出来的旧行，一并丢掉，否则清完又被填回去
+        while True:
+            try:
+                LOG_QUEUE.get_nowait()
+            except queue.Empty:
+                break
+        for p in (LOG_PATH, COMFY_LOG_PATH):
+            try:
+                with open(p, "w", encoding="utf-8"):
+                    pass
+            except OSError:
+                pass
+        _append("INFO", "🧹 日志已清空（显示区 + 内存缓冲 + 日志文件）")
+
+    tk.Button(log_tools, text="🧹 清空日志", command=do_clear_logs,
+              font=("Microsoft YaHei UI", 8), padx=8, pady=1).pack(side="right")
+    tk.Label(log_tools, text="清空只影响显示区与日志文件，不会动 ComfyUI 进程",
+             fg="#888", font=("Microsoft YaHei UI", 8)).pack(side="left", padx=2)
 
     MAX_LOG_LINES = 4000   # 单个日志面板最多保留行数，防止长时间运行后 Tk 文本控件吃满内存
 
@@ -1362,7 +1397,7 @@ def run_gui():
 # 更新机制（由壳 exe 调用；core.py 本身可被热替换）
 # ══════════════════════════════════════════════════════════════
 
-CORE_VERSION = "1.0.10"
+CORE_VERSION = "1.0.11"
 # 更新源：GitHub 直连 + 加速镜像列表 + 仓库地址。version.json 与 core.py 放仓库根目录。
 # 逻辑文件（version.json / core.py）：prefix + /<repo>/<branch>/<file>
 # Release 附件（exe）：prefix + /https://github.com/<repo>/releases/download/<tag>/<name>
