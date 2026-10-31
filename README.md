@@ -249,3 +249,9 @@ gh release create v1.0.5 "dist\comfy_launcher.exe" --title "v1.0.5" --notes "说
 ## 致谢
 
 - 应用图标由豆包（Doubao）AI 创作生成。
+
+## 说明
+
+本项目**全部代码由 DeepSeek 全程构建**——包括 `core.py`（GUI + 管理 API + 进程管理 + 自更新）、`comfy_launcher.py`（壳）、`make_version.py`（发布工具）、`build.bat` / `create_venv.bat` / `start_launcher.bat` 构建脚本，以及本文档的内容整理与校订。
+
+日常使用中如遇问题，把界面「实时日志」里的报错贴出来即可定位。
