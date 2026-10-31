@@ -32,13 +32,16 @@ GUI 第二栏「启动选项」四项，勾选即写入配置、下次启动 Com
 ```
 comfyui-launcher/
 ├── comfy_launcher.py        # 壳（可执行入口，打包为 exe；含 PyInstaller 依赖锚点）
+├── comfy_launcher.exe       # 打包好的启动器本体（raw 方式分发，哈希与 version.json 一致）
 ├── core.py                  # 核心逻辑（可热替换，更新即覆盖此文件）
 ├── make_version.py          # 发布工具：生成 version.json（版本 + 哈希）
 ├── version.json             # 版本清单（更新对比基准）
 ├── build.bat                # 打包 exe（自动生成 version.json 并复制 core.py）
-├── create_venv.bat          # 创建虚拟环境 + 安装 PyInstaller
+├── create_venv.bat          # 创建虚拟环境 + 安装 PyInstaller / FastAPI
 ├── start_launcher.bat       # 源码模式启动
-└── comfy_launcher.ico       # 应用程序图标
+├── comfy_launcher.ico       # 应用程序图标（打包用）
+├── congmfyui启动器图标.png   # 图标原图 2048×2048（豆包 AI 生成）
+└── icon_preview.png         # 图标预览 256×256
 ```
 
 ## 使用（分发模式）
