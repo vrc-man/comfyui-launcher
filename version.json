@@ -1,8 +1,8 @@
 {
-  "version": "1.0.9",
-  "core_sha256": "261842771b2d3cbcd63c6e8804e7d75151d18b4b91cf09170218698ee9f3e968",
-  "core_size": 79865,
-  "changelog": "GUI 顶栏显示内核版本；build.bat 自动递增版本并重生成 version.json（core+exe 双哈希）并同步 dist 与仓库本体；.bat 转 CRLF 修复 cmd 解析错位",
+  "version": "1.0.10",
+  "core_sha256": "d3c32efe403230077a5c0fb9b522b6519d1b037408642b5562eef9bef63fd05d",
+  "core_size": 86027,
+  "changelog": "检查更新改为置顶小窗提示（滚动进度条，检测完成自动关闭）；修复 worker 线程直接调 tkinter 导致的静默失败（改线程安全 UI 队列）；版本清单改为多源并行拉取+双源一致即采用+发现更高版本立即返回，检查耗时从 8s 降到约 1s",
   "exe": {
     "sha256": "e7de34e698599102d80281041708196f400a91272285e1ed7cc9c57383812f4d",
     "size": 17949694,

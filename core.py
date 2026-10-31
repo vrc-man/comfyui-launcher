@@ -977,6 +977,27 @@ def run_gui():
     def _append(level, line, source="launcher"):
         _append_to(launcher_text if source == "launcher" else comfy_text, level, line)
 
+    # ── 线程安全 UI 队列 ──
+    # tkinter 只能在主线程操作：worker 线程里直接 root.after(...) 会抛
+    # "main thread is not in main loop"（旧代码用 except 吞掉，导致弹窗关不掉、日志不刷新）。
+    # 统一改走队列，由主线程定时泵出执行。
+    _ui_q = queue.Queue()
+
+    def ui_call(fn, *args):
+        _ui_q.put((fn, args))
+
+    def pump_ui():
+        while True:
+            try:
+                fn, args = _ui_q.get_nowait()
+            except queue.Empty:
+                break
+            try:
+                fn(*args)
+            except Exception as e:
+                _log("ERROR", f"UI 回调异常: {type(e).__name__}: {e}")
+        root.after(50, pump_ui)
+
     def pump_logs():
         while True:
             try:
@@ -1070,9 +1091,9 @@ def run_gui():
     def _do_start():
         r = _manager.start(load_config())
         if not r.get("ok"):
-            root.after(0, lambda: messagebox.showerror("启动失败", r.get("error", "未知错误")))
+            ui_call(messagebox.showerror, "启动失败", r.get("error", "未知错误"))
         else:
-            root.after(0, lambda: _append("INFO", f"✓ {r.get('message')}"))
+            ui_call(_append, "INFO", f"✓ {r.get('message')}")
 
     def do_stop():
         _persist_settings_now()
@@ -1081,7 +1102,7 @@ def run_gui():
 
     def _do_stop():
         r = _manager.stop()
-        root.after(0, lambda: _append("INFO", f"✓ {r.get('message')}"))
+        ui_call(_append, "INFO", f"✓ {r.get('message')}")
 
     def do_restart():
         _persist_settings_now()
@@ -1091,9 +1112,9 @@ def run_gui():
     def _do_restart():
         r = _manager.restart(load_config())
         if not r.get("ok"):
-            root.after(0, lambda: messagebox.showerror("重启失败", r.get("error", "未知错误")))
+            ui_call(messagebox.showerror, "重启失败", r.get("error", "未知错误"))
         else:
-            root.after(0, lambda: _append("INFO", f"✓ {r.get('message')}"))
+            ui_call(_append, "INFO", f"✓ {r.get('message')}")
 
     def do_test_proxy():
         """测试代理能否拉到 GitHub 官方清单（不写配置，纯探测）。"""
@@ -1106,67 +1127,183 @@ def run_gui():
             if r.get("ok"):
                 msg = (f"连通正常\n\n代理: {r.get('proxy') or '未使用（直连 / 系统代理）'}\n"
                        f"远端版本: v{r.get('version')}\n耗时: {r.get('ms')} ms")
-                root.after(0, lambda: _append("INFO", f"✓ 网络测试通过 {r.get('ms')}ms  v{r.get('version')}"
-                                                       f"（代理: {r.get('proxy') or '直连'}）"))
-                root.after(0, lambda: messagebox.showinfo("网络测试", msg))
+                ui_call(_append, "INFO", f"✓ 网络测试通过 {r.get('ms')}ms  v{r.get('version')}"
+                                  f"（代理: {r.get('proxy') or '直连'}）")
+                ui_call(messagebox.showinfo, "网络测试", msg)
             else:
                 msg = (f"拉取失败\n\n代理: {r.get('proxy') or '未使用（直连 / 系统代理）'}\n"
                        f"地址: {r.get('url')}\n错误: {r.get('error')}")
-                root.after(0, lambda: _append("WARN", f"⚠ 网络测试失败: {r.get('error')}"))
-                root.after(0, lambda: messagebox.showerror("网络测试", msg))
+                ui_call(_append, "WARN", f"⚠ 网络测试失败: {r.get('error')}")
+                ui_call(messagebox.showerror, "网络测试", msg)
 
         _run_in_thread(_worker)
 
+    # ── 「请稍等」小窗：检测/下载期间显示在最前面，结束自动关闭 ──
+    def _show_busy(title_text, hint_text, slow_hint="网络较慢，仍在检测，请稍候…"):
+        """弹出置顶小窗（带滚动进度条），返回幂等的 close()。
+
+        Tk 只能在主线程操作，这里全程在主线程创建；网络请求在子线程，结束后
+        由 ui_call 交回主线程销毁，避免跨线程碰控件。
+        """
+        win = tk.Toplevel(root)
+        win.title(title_text)
+        win.transient(root)
+        win.resizable(False, False)
+        try:
+            win.attributes("-topmost", True)
+        except Exception:
+            pass
+        body = tk.Frame(win, padx=20, pady=16)
+        body.pack(fill="both", expand=True)
+        label = tk.Label(body, text=hint_text, font=("Microsoft YaHei UI", 10))
+        label.pack(anchor="w")
+        pb = ttk.Progressbar(body, mode="indeterminate", length=280)
+        pb.pack(pady=(12, 0), fill="x")
+        try:
+            pb.start(12)
+        except Exception:
+            pass
+
+        win.update_idletasks()
+        try:                                    # 居中偏上，别挡住主按钮
+            x = root.winfo_rootx() + (root.winfo_width() - win.winfo_width()) // 2
+            y = root.winfo_rooty() + (root.winfo_height() - win.winfo_height()) // 3
+            win.geometry(f"+{max(x, 0)}+{max(y, 0)}")
+        except Exception:
+            pass
+        win.lift()
+        try:
+            win.focus_force()
+        except Exception:
+            pass
+
+        state = {"closed": False}
+
+        def _slower():
+            if not state["closed"] and slow_hint:
+                try:
+                    label.config(text=slow_hint)
+                except Exception:
+                    pass
+
+        try:
+            root.after(1500, _slower)           # 超过 1.5 秒还没结果就提示慢
+        except Exception:
+            pass
+
+        def close():
+            if state["closed"]:
+                return
+            state["closed"] = True
+            try:
+                pb.stop()
+            except Exception:
+                pass
+            try:
+                win.destroy()
+            except Exception:
+                pass
+
+        win.protocol("WM_DELETE_WINDOW", close)   # 允许用户自己点 X，close 幂等
+        return close
+
     def do_check_update():
+        close_busy = _show_busy("检查更新", "正在检测新版本，请稍等…")
+
+        def _to_main(fn, *a):
+            try:
+                ui_call(fn, *a)
+            except Exception:
+                pass
+
         def _worker():
             try:
                 st = check_update(verbose=True)
-                if not st.get("ok"):
-                    root.after(0, lambda: _append("WARN", f"⚠ 检查更新失败: {st.get('reason', '')}"))
-                    return
-                core_up = bool(st.get("core_has_update"))
-                exe_up = bool(st.get("exe_has_update"))
-                if not core_up and not exe_up:
-                    root.after(0, lambda: _append("INFO", f"✓ {st.get('reason', '')} (v{st.get('current', '')})"))
-                    return
-                parts = []
-                if core_up:
-                    parts.append("· 核心逻辑 core.py（热更新，无需重下 exe）")
-                if exe_up:
-                    size = st.get("exe_size") or 0
-                    parts.append(f"· 启动器本体 exe（{size / 1048576:.1f} MB，会替换文件并自动重启）"
-                                 if size else "· 启动器本体 exe（会替换文件并自动重启）")
-                msg = f"发现新版本 v{st.get('latest')}\n当前 v{st.get('current')}\n\n本次更新包含:\n" + "\n".join(parts)
-                cl = st.get("changelog")
-                if cl:
-                    msg += f"\n\n更新说明:\n{cl}"
-                if not messagebox.askyesno("发现新版本", msg + "\n\n是否立即更新？"):
-                    return
-
-                if core_up:
-                    r = apply_update()
-                    if not r.get("ok"):
-                        root.after(0, lambda: messagebox.showerror("核心更新失败", r.get("error", "未知错误")))
-                        return
-                    root.after(0, lambda: _append("INFO", f"✓ core.py 已更新到 v{st.get('latest')}"))
-
-                if exe_up:
-                    root.after(0, lambda: _append("INFO", "正在下载启动器本体..."))
-                    r2 = apply_exe_update()
-                    if not r2.get("ok"):
-                        root.after(0, lambda: messagebox.showerror(
-                            "本体更新失败",
-                            r2.get("error", "未知错误") + "\n\n核心逻辑的更新已生效，重启后仍是旧版 exe。"))
-                        root.after(1500, restart_self)
-                        return
-                    root.after(0, lambda: _append("INFO", "✓ 本体已下载，正在替换并重启..."))
-                    root.after(800, lambda: launch_exe_swap(r2["script"]))   # 不返回
-                    return
-
-                root.after(0, lambda: _append("INFO", f"✓ 更新完成，正在重启... v{st.get('latest')}"))
-                root.after(1500, restart_self)
             except Exception as e:
-                root.after(0, lambda: _append("ERROR", f"✗ 检查更新异常: {e}"))
+                _to_main(lambda: (close_busy(), _append("ERROR", f"✗ 检查更新异常: {e}")))
+                return
+            _to_main(_on_checked, st)
+
+        def _on_checked(st):
+            close_busy()
+            if not st.get("ok"):
+                _append("WARN", f"⚠ 检查更新失败: {st.get('reason', '')}")
+                messagebox.showwarning("检查更新",
+                                       f"检测失败：{st.get('reason', '未知原因')}\n\n"
+                                       "可稍后重试；有代理的话在「更新代理」里填上 IP 和端口再试。")
+                return
+            core_up = bool(st.get("core_has_update"))
+            exe_up = bool(st.get("exe_has_update"))
+            if not core_up and not exe_up:
+                _append("INFO", f"✓ {st.get('reason', '')} (v{st.get('current', '')})")
+                messagebox.showinfo("检查更新",
+                                    f"当前已是最新版本 v{st.get('current', '')}。")
+                return
+
+            parts = []
+            if core_up:
+                parts.append("· 核心逻辑 core.py（热更新，无需重下 exe）")
+            if exe_up:
+                size = st.get("exe_size") or 0
+                parts.append(f"· 启动器本体 exe（{size / 1048576:.1f} MB，会替换文件并自动重启）"
+                             if size else "· 启动器本体 exe（会替换文件并自动重启）")
+            msg = (f"发现新版本 v{st.get('latest')}\n当前 v{st.get('current')}"
+                   f"\n\n本次更新包含:\n" + "\n".join(parts))
+            cl = st.get("changelog")
+            if cl:
+                msg += f"\n\n更新说明:\n{cl}"
+            if not messagebox.askyesno("发现新版本", msg + "\n\n是否立即更新？"):
+                return
+            # 下载阶段：同样用置顶小窗提示，避免界面像"卡住"
+            _apply_update_async(st, core_up, exe_up)
+
+        def _apply_update_async(st, core_up, exe_up):
+            close_dl = _show_busy("正在更新", "正在下载并校验更新，请稍等…")
+
+            def _done_exe(script):
+                close_dl()
+                _append("INFO", "✓ 本体已下载，正在替换并重启…")
+                root.after(900, lambda: launch_exe_swap(script))
+
+            def _done_core_only(ver):
+                close_dl()
+                _append("INFO", f"✓ 更新完成，正在重启… v{ver}")
+                root.after(1200, restart_self)
+
+            def _fail_exe(err):
+                close_dl()
+                _append("WARN", f"⚠ 本体更新失败: {err}")
+                messagebox.showerror("本体更新失败",
+                                     f"{err}\n\n核心逻辑的更新已生效，重启后仍是旧版 exe。")
+                root.after(1500, restart_self)
+
+            def _fail_core(err):
+                close_dl()
+                _append("ERROR", f"✗ 核心更新失败: {err}")
+                messagebox.showerror("核心更新失败", err)
+
+            def _do():
+                try:
+                    if core_up:
+                        r = apply_update()
+                        if not r.get("ok"):
+                            _to_main(_fail_core, r.get("error", "未知错误"))
+                            return
+                        _to_main(_append, "INFO", f"✓ core.py 已更新到 v{st.get('latest')}")
+
+                    if exe_up:
+                        r2 = apply_exe_update()
+                        if not r2.get("ok"):
+                            _to_main(_fail_exe, r2.get("error", "未知错误"))
+                            return
+                        _to_main(_done_exe, r2["script"])
+                        return
+
+                    _to_main(_done_core_only, st.get("latest"))
+                except Exception as e:
+                    _to_main(lambda: (close_dl(), _append("ERROR", f"✗ 更新异常: {e}")))
+
+            _run_in_thread(_do)
 
         _run_in_thread(_worker)
 
@@ -1213,6 +1350,7 @@ def run_gui():
 
     root.protocol("WM_DELETE_WINDOW", _on_close)
 
+    root.after(50, pump_ui)
     root.after(200, pump_logs)
     root.after(500, refresh_status)
     root.after(300, refresh_hint)
@@ -1224,7 +1362,7 @@ def run_gui():
 # 更新机制（由壳 exe 调用；core.py 本身可被热替换）
 # ══════════════════════════════════════════════════════════════
 
-CORE_VERSION = "1.0.9"
+CORE_VERSION = "1.0.10"
 # 更新源：GitHub 直连 + 加速镜像列表 + 仓库地址。version.json 与 core.py 放仓库根目录。
 # 逻辑文件（version.json / core.py）：prefix + /<repo>/<branch>/<file>
 # Release 附件（exe）：prefix + /https://github.com/<repo>/releases/download/<tag>/<name>
@@ -1310,25 +1448,67 @@ def _http_get_bytes(url: str, timeout: int, proxy: str = "") -> Optional[bytes]:
         return r.read()
 
 
-def _fetch_version_info(ucfg: dict) -> Optional[dict]:
-    """拉 version.json：把所有源都问一遍，取版本号最高的那份。
+def _fetch_version_info(ucfg: dict, newer_than: str = "") -> Optional[dict]:
+    """拉 version.json：所有源并行问一遍，取版本号最高的那份。
 
-    原因：raw.githubusercontent.com 有 CDN 缓存（刚发版可能仍返回旧清单），
-    旧实现只要第一个源成功就返回，用户会误判「已是最新」并持续几分钟。
+    为什么并行：串行时一个慢镜像（实测 gh-proxy 有一次 6.9s）会把「检查更新」
+    拖到 8 秒以上，用户只看到「请稍等」在转。并行后总耗时 ≈ 最慢的那个，且
+    一旦发现某源版本已经比本地新，就直接返回，不必等慢源。
+
+    为什么还要问所有源：raw.githubusercontent.com 有 CDN 缓存，刚发版时可能
+    仍返回旧清单；只信第一个源会误判「已是最新」。
     """
-    best, best_t = None, ()
-    for mirror in ucfg["mirrors"]:
-        url = f"{mirror}/{ucfg['repo']}/{ucfg['branch']}/{ucfg['version_file']}"
+    mirrors = list(ucfg.get("mirrors") or [])
+    if not mirrors:
+        return None
+    timeout = min(5, int(ucfg.get("timeout", 15)))
+    proxy = ucfg.get("proxy", "")
+    base = f"{ucfg['repo']}/{ucfg['branch']}/{ucfg['version_file']}"
+    local_t = _ver_tuple(newer_than) if newer_than else ()
+
+    got, lock = [], threading.Lock()
+
+    def _one(m):
         try:
-            data = _http_get_bytes(url, int(ucfg.get("timeout", 15)), ucfg.get("proxy", ""))
+            data = _http_get_bytes(f"{m}/{base}", timeout, proxy)
             info = json.loads(data.decode("utf-8-sig"))
+            if isinstance(info, dict):
+                with lock:
+                    got.append(info)
         except Exception:
-            continue
-        if not isinstance(info, dict):
-            continue
-        t = _ver_tuple(str(info.get("version", "")))
-        if best is None or t > best_t:
-            best, best_t = info, t
+            pass
+
+    threads = [threading.Thread(target=_one, args=(m,), daemon=True) for m in mirrors]
+    for t in threads:
+        t.start()
+
+    deadline = time.time() + timeout + 1.0
+    while time.time() < deadline:
+        with lock:
+            snapshot = list(got)
+        best, best_t = None, ()
+        for info in snapshot:
+            vt = _ver_tuple(str(info.get("version", "")))
+            if best is None or vt > best_t:
+                best, best_t = info, vt
+        if local_t and best_t and best_t > local_t:
+            return best                      # 已确认有更新，慢源不等了
+        # 两个源报了同一版本 → 基本可排除「某源缓存旧清单」，直接采用
+        if len(snapshot) >= 2:
+            vers = [str(i.get("version", "")) for i in snapshot]
+            if max(vers.count(v) for v in set(vers)) >= 2:
+                return best
+        if len(snapshot) == len(mirrors):
+            return best
+        time.sleep(0.05)
+
+    with lock:
+        snapshot = list(got)
+    best, best_t = None, ()
+    for info in snapshot:
+        vt = _ver_tuple(str(info.get("version", "")))
+        if best is None or vt > best_t:
+            best, best_t = info, vt
     return best
 
 
@@ -1338,7 +1518,7 @@ def _fetch_all_version_info(ucfg: dict) -> list:
     for mirror in ucfg["mirrors"]:
         url = f"{mirror}/{ucfg['repo']}/{ucfg['branch']}/{ucfg['version_file']}"
         try:
-            info = json.loads(_http_get_bytes(url, int(ucfg.get("timeout", 15)), ucfg.get("proxy", "")).decode("utf-8-sig"))
+            info = json.loads(_http_get_bytes(url, min(8, int(ucfg.get("timeout", 15))), ucfg.get("proxy", "")).decode("utf-8-sig"))
         except Exception:
             continue
         if not isinstance(info, dict):
@@ -1509,7 +1689,7 @@ def check_update(verbose: bool = False) -> dict:
           changelog, exe_url, exe_size, exe_sha256, reason}
     """
     ucfg = _load_update_config(load_config())
-    info = _fetch_version_info(ucfg)
+    info = _fetch_version_info(ucfg, newer_than=CORE_VERSION)
     if not info:
         return {"ok": False, "has_update": False, "core_has_update": False,
                 "exe_has_update": False, "reason": "无法获取版本信息（网络或镜像失效）"}
