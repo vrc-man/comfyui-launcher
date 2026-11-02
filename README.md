@@ -160,6 +160,64 @@ gh release create v1.0.5 "dist\comfy_launcher.exe" --title "v1.0.5" --notes "说
 - 只改了 `core.py` 的版本：不用重新打包、不用动 `exe` 字段，直接推 `core.py` + `version.json`
 - 改了 `comfy_launcher.py`（壳）却不重打包 → 老用户的旧 exe 拿不到壳的修复（只有 `core.py` 能热更新）
 
+## 分享 API（给外部应用调用，URL 里带密钥）
+
+ComfyUI 自身没有任何鉴权，直接穿透 8188 等于把「执行任意工作流」的能力交出去。启动器内置了一个**分享网关**，用「地址 + 密钥」的方式把 API 暴露给别人：
+
+```
+外面应用 ──> 穿透服务端 ──> 本机网关 127.0.0.1:8189 ──> ComfyUI 127.0.0.1:8188
+                             │ 校验 URL 里的密钥
+```
+
+开启：GUI「分享 API」里勾「启用」→ 点「生成」得到 32 位密钥 → 点「应用」。然后**只把 8189 端口做穿透**，8188 继续只绑本机。
+
+客户端契约（两种带密钥方式，任选）：
+
+```bash
+# 方式1：URL 前缀（最省事，适合不会加请求头的客户端）
+curl -X POST "http://<穿透地址>:8189/<你的密钥>/prompt" \
+     -H "Content-Type: application/json" --data-binary @workflow_api.json
+
+curl "http://<穿透地址>:8189/<你的密钥>/history/<prompt_id>"
+curl "http://<穿透地址>:8189/<你的密钥>/view?filename=out.png&type=output" -o out.png
+
+# 方式2：请求头（URL 干净，不会漏进日志/Referer）
+curl -X POST "http://<穿透地址>:8189/prompt" -H "X-Token: <你的密钥>" ...
+```
+
+```python
+import requests
+BASE = "http://<穿透地址>:8189/<你的密钥>"
+pid = requests.post(f"{BASE}/prompt", json={"prompt": wf}).json()["prompt_id"]
+info = requests.get(f"{BASE}/history/{pid}").json()
+img  = requests.get(f"{BASE}/view", params={"filename": "out.png", "type": "output"}).content
+```
+
+网关行为：
+
+| 项 | 说明 |
+|---|---|
+| 校验失败 | 一律返回 **404**（不暴露"这里有个服务"），并按 IP 限速（默认 60 次/分钟） |
+| 只放行 API（默认开） | 只允许 `/prompt` `/history` `/queue` `/interrupt` `/free` `/view` `/view_metadata` `/object_info` `/system_stats` `/features` `/embeddings` `/models` `/api/*` `/ws` `/upload/*`，网页界面与静态资源全挡掉 |
+| WebSocket | `/ws` 走裸 TCP 双向透传，执行进度事件可用 |
+| 日志 | 密钥一律替换为 `***` 再落盘 |
+| 绑定地址 | 默认只绑 `127.0.0.1`（穿透客户端在同一台机器时最安全），需要局域网直连再改 `share.host` |
+
+配置对应：
+
+```json
+"share": {
+  "enabled": true,
+  "host": "127.0.0.1",
+  "port": 8189,
+  "keys": ["<32位密钥>"],        // 可放多个，便于按客户端单独吊销
+  "api_only": true,
+  "rate_limit_per_min": 60
+}
+```
+
+> 安全底线：密钥泄露 ≈ 主机可被任意工作流操作（自定义节点能读写文件/执行命令）。请用长随机串、定期更换、按客户端分发不同 key；穿透尽量走 HTTPS，必要时再叠 Cloudflare Access / IP 白名单。
+
 ## 管理 API
 
 本地 `http://127.0.0.1:18808`（端口可在 GUI 配置），请求头 `X-Key` 鉴权：
@@ -184,7 +242,16 @@ gh release create v1.0.5 "dist\comfy_launcher.exe" --title "v1.0.5" --notes "说
 
 ## 变更记录
 
-### v1.0.12
+'### v1.0.13
+
+- 新增**分享网关**：把 ComfyUI 的 API 以「地址 + 密钥」形式提供给外部应用（内网穿透场景），调用形如 `http://<穿透地址>:8189/<密钥>/prompt`
+  - 支持 URL 前缀与 `X-Token` 头两种带密钥方式；密钥支持多个，便于按客户端吊销
+  - 默认「只放行 API」：网页界面、静态资源、上传口之外的路径一律 404
+  - 校验失败统一 404 + 按 IP 限速；日志里密钥全部替换为 `***`
+  - `/ws` 走裸 TCP 双向透传，执行进度可用
+  - GUI 新增「分享 API」区：启用 / 端口 / 密钥（生成、复制）/ 只放行 API / 应用（重启网关）+ 运行状态与调用示例
+
+### v1.0.12'
 
 - **修 UI 卡顿（关键性能问题）**：日志面板原来每插一行都调 `text.tag_config(...)`，tkinter 会把该 tag 重新应用到全文（O(n²)）——实测 1500 行要 **23 秒**（65 行/秒），ComfyUI 一刷日志界面就冻住。改为 tag 只配置一次 + 每批日志一次 `insert` + 按行 `tag_add`：**99,087 行/秒**，3000 行实测 1.13 秒渲染完，UI 定时器抖动仅 1ms
 - ComfyUI 日志落盘改为**攒批写**（8KB 或 0.6 秒触发一次，另有后台兜底线程），不再是每行 open/write/close：吞吐 3,753 → 66,367 行/秒

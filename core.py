@@ -56,6 +56,16 @@ DEFAULT_CONFIG = {
     "auto_start_comfyui": False,
     # 启动时自动检测更新（可 GUI 勾选；默认关闭，仅用「检查更新」按钮手动更新）
     "update": {"auto": False},
+    # ── 分享网关：把 ComfyUI 的 API 以「地址 + 密钥」形式提供给外部应用 ──
+    # 外部调用：http://<穿透地址>:<share.port>/<key>/prompt
+    "share": {
+        "enabled": False,
+        "host": "127.0.0.1",      # 只绑本机；穿透客户端也在本机时保持 127.0.0.1 最安全
+        "port": 8189,
+        "keys": [],               # 可放多个 key，便于按客户端单独吊销
+        "api_only": True,         # true=只转发 API 路径，不暴露网页界面与上传接口
+        "rate_limit_per_min": 60, # 单 IP 每分钟失败上限
+    },
     "comfyui": {
         "comfyui_path": "",
         "python_path": "",
@@ -715,6 +725,309 @@ def start_http_server(cfg: dict) -> threading.Thread:
     return th
 
 
+# ══════════════════════════════════════════════════════════════
+# 分享网关：/<KEY>/prompt -> 127.0.0.1:8188/prompt
+#   给外部应用（机器对机器）用的「地址 + 密钥」鉴权，ComfyUI 自身没有鉴权能力。
+#   只做转发 + 校验，不改 ComfyUI 任何代码。
+# ══════════════════════════════════════════════════════════════
+
+# api_only=true 时只放行这些前缀（网页界面 / 上传接口一律挡掉）
+SHARE_API_PREFIXES = (
+    "/prompt", "/history", "/queue", "/interrupt", "/free",
+    "/view", "/view_metadata", "/object_info", "/system_stats", "/features",
+    "/embeddings", "/models", "/api/", "/ws", "/upload/",
+)
+
+_share_lock = threading.Lock()
+_share_server = None
+_share_fails = {}          # ip -> deque[ts]，用于失败限速
+
+
+def share_config(cfg: dict = None) -> dict:
+    """合并默认值与用户配置，并算出要转发到的 ComfyUI 端口。"""
+    cfg = cfg or load_config()
+    conf = json.loads(json.dumps(DEFAULT_CONFIG["share"]))
+    for k, v in (cfg.get("share") or {}).items():
+        if k in conf:
+            conf[k] = v
+    conf["keys"] = [str(k).strip() for k in (conf.get("keys") or []) if str(k).strip()]
+    try:
+        conf["target_port"] = int((cfg.get("comfyui") or {}).get("port", 8188))
+    except (TypeError, ValueError):
+        conf["target_port"] = 8188
+    conf["target_host"] = "127.0.0.1"
+    try:
+        conf["port"] = int(conf.get("port") or 8189)
+    except (TypeError, ValueError):
+        conf["port"] = 8189
+    try:
+        conf["rate_limit_per_min"] = int(conf.get("rate_limit_per_min") or 60)
+    except (TypeError, ValueError):
+        conf["rate_limit_per_min"] = 60
+    return conf
+
+
+def _share_redact(text: str, keys) -> str:
+    for k in keys:
+        if k and k in text:
+            text = text.replace(k, "***")
+    return text
+
+
+def _share_key_ok(candidate: str, keys) -> bool:
+    if not candidate:
+        return False
+    for k in keys:
+        try:
+            if secrets.compare_digest(str(candidate), k):
+                return True
+        except Exception:
+            continue
+    return False
+
+
+class _ShareHandler(http.server.BaseHTTPRequestHandler):
+    """/<KEY>/<rest> -> http://127.0.0.1:<comfy_port>/<rest>，支持 Cookie-less 的机器调用与 WS 透传。"""
+
+    protocol_version = "HTTP/1.1"
+    server_version = "ComfyShare/1.0"
+
+    # 不要往 stderr 打（windowed 下是 None）
+    def log_message(self, fmt, *args):
+        pass
+
+    # ── 小工具 ──
+    @property
+    def conf(self) -> dict:
+        return self.server.share_conf
+
+    def _client_ip(self) -> str:
+        return self.client_address[0] if self.client_address else "?"
+
+    def _too_many_fails(self) -> bool:
+        limit = self.conf["rate_limit_per_min"]
+        if limit <= 0:
+            return False
+        q = _share_fails.setdefault(self._client_ip(), deque(maxlen=limit + 5))
+        now = time.time()
+        while q and now - q[0] > 60:
+            q.popleft()
+        return len(q) >= limit
+
+    def _note_fail(self):
+        q = _share_fails.setdefault(self._client_ip(), deque(maxlen=200))
+        q.append(time.time())
+
+    def _deny(self, why: str):
+        keys = self.conf["keys"]
+        _log("WARN", _share_redact(f"分享网关拒绝 {self._client_ip()} {self.command} {self.path}：{why}", keys))
+        body = b'{"error":"not found"}'
+        try:
+            self.send_response(404)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        except Exception:
+            pass
+
+    def _split(self):
+        """拆出 (key_from_path, rest_path, query)。"""
+        raw = self.path
+        query = ""
+        if "?" in raw:
+            raw, _, query = raw.partition("?")
+        parts = raw.lstrip("/").split("/", 1)
+        first = parts[0] if parts else ""
+        rest = "/" + (parts[1] if len(parts) > 1 else "")
+        return first, rest, query
+
+    def _read_body(self):
+        te = (self.headers.get("Transfer-Encoding") or "").lower()
+        if "chunked" in te:
+            chunks = []
+            while True:
+                line = self.rfile.readline(65536).strip()
+                if not line:
+                    break
+                try:
+                    size = int(line.split(b";")[0], 16)
+                except ValueError:
+                    break
+                if size == 0:
+                    self.rfile.readline(65536)
+                    break
+                chunks.append(self.rfile.read(size))
+                self.rfile.readline(65536)
+            return b"".join(chunks)
+        n = int(self.headers.get("Content-Length") or 0)
+        return self.rfile.read(n) if n > 0 else b""
+
+    # ── 业务入口 ──
+    def do_GET(self): self._handle("GET")
+    def do_POST(self): self._handle("POST")
+    def do_PUT(self): self._handle("PUT")
+    def do_DELETE(self): self._handle("DELETE")
+    def do_PATCH(self): self._handle("PATCH")
+    def do_HEAD(self): self._handle("HEAD")
+
+    def _handle(self, method: str):
+        conf = self.conf
+        keys = conf["keys"]
+        try:
+            if self._too_many_fails():
+                return self._deny("失败次数超限")
+            first, rest, query = self._split()
+            header_key = self.headers.get("X-Token") or self.headers.get("X-Api-Key") or ""
+            if rest != "/" or _share_key_ok(first, keys):
+                # 形如 /<KEY>/prompt
+                if not _share_key_ok(first, keys):
+                    self._note_fail()
+                    return self._deny("路径密钥无效")
+                target_path, key_used = rest, first
+            elif _share_key_ok(header_key, keys):
+                target_path, key_used = "/" + first + rest.lstrip("/"), header_key
+            else:
+                self._note_fail()
+                return self._deny("缺少或错误的密钥")
+
+            if conf.get("api_only", True):
+                probe = target_path
+                if not any(probe == p or probe.startswith(p) for p in SHARE_API_PREFIXES):
+                    return self._deny(f"路径不在 API 白名单: {probe}")
+
+            up_target = target_path + (("?" + query) if query else "")
+            if "websocket" in (self.headers.get("Upgrade") or "").lower():
+                return self._relay_ws(up_target, key_used)
+            return self._proxy(method, up_target, key_used)
+        except Exception as e:
+            _log("ERROR", _share_redact(f"分享网关异常: {type(e).__name__}: {e}", keys))
+            try:
+                self.send_response(502); self.send_header("Content-Length", "0"); self.end_headers()
+            except Exception:
+                pass
+
+    def _proxy(self, method: str, up_target: str, key_used: str):
+        conf = self.conf
+        body = self._read_body() if method in ("POST", "PUT", "PATCH", "DELETE") else None
+        drop = ("host", "connection", "keep-alive", "proxy-connection", "transfer-encoding", "upgrade")
+        headers = {k: v for k, v in self.headers.items() if k.lower() not in drop}
+        headers["X-Forwarded-For"] = self._client_ip()
+        conn = http.client.HTTPConnection(conf["target_host"], int(conf["target_port"]), timeout=300)
+        try:
+            conn.request(method, up_target, body=body, headers=headers)
+            resp = conn.getresponse()
+            data = resp.read()
+            self.send_response(resp.status, resp.reason)
+            for k, v in resp.getheaders():
+                if k.lower() in ("transfer-encoding", "connection", "content-length", "keep-alive"):
+                    continue
+                self.send_header(k, v)
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            if method != "HEAD":
+                self.wfile.write(data)
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    def _relay_ws(self, up_target: str, key_used: str):
+        """WebSocket 透传：握手后裸字节双向 relay（ComfyUI 的 /ws 靠它推进度）。"""
+        conf = self.conf
+        up = socket.create_connection((conf["target_host"], int(conf["target_port"])), timeout=30)
+        head = [f"GET {up_target} HTTP/1.1"]
+        for k, v in self.headers.items():
+            if k.lower() in ("host",):
+                continue
+            head.append(f"{k}: {v}")
+        up.sendall(("\r\n".join(head) + "\r\n\r\n").encode("latin-1", "replace"))
+
+        def pump(src, dst):
+            try:
+                while True:
+                    chunk = src.recv(65536)
+                    if not chunk:
+                        break
+                    dst.sendall(chunk)
+            except Exception:
+                pass
+            finally:
+                try:
+                    dst.shutdown(socket.SHUT_WR)
+                except Exception:
+                    pass
+
+        t = threading.Thread(target=pump, args=(up, self.connection), daemon=True)
+        t.start()
+        pump(self.connection, up)
+        t.join(timeout=5)
+        try:
+            up.close()
+        except Exception:
+            pass
+
+    def _deny_after_ws(self):
+        pass
+
+
+class _ShareServer(http.server.ThreadingHTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
+    def __init__(self, addr, handler, conf):
+        super().__init__(addr, handler)
+        self.share_conf = conf
+
+
+def start_share_gateway(cfg: dict = None) -> dict:
+    """启动分享网关；返回 {ok, host, port, error}。"""
+    global _share_server
+    conf = share_config(cfg)
+    if not conf.get("enabled"):
+        return {"ok": False, "error": "分享网关未启用"}
+    if not conf["keys"]:
+        return {"ok": False, "error": "没有设置访问密钥"}
+    stop_share_gateway()
+    host, port = conf["host"], conf["port"]
+    try:
+        srv = _ShareServer((host, port), _ShareHandler, conf)
+    except OSError as e:
+        _log("ERROR", f"分享网关无法监听 {host}:{port}: {e}")
+        return {"ok": False, "error": f"端口 {port} 绑定失败：{e}"}
+    threading.Thread(target=srv.serve_forever, daemon=True, name="share-gateway").start()
+    with _share_lock:
+        _share_server = srv
+    _log("INFO", f"分享网关已启动 http://{host}:{port}/<KEY>/  ->  ComfyUI 127.0.0.1:{conf['target_port']}"
+                 f"（API {'白名单' if conf.get('api_only', True) else '全放行'}，{len(conf['keys'])} 个密钥）")
+    return {"ok": True, "host": host, "port": port, "keys": len(conf["keys"])}
+
+
+def stop_share_gateway() -> None:
+    global _share_server
+    with _share_lock:
+        srv, _share_server = _share_server, None
+    if srv is not None:
+        try:
+            srv.shutdown()
+            srv.server_close()
+        except Exception:
+            pass
+        _log("INFO", "分享网关已停止")
+
+
+def share_gateway_status() -> dict:
+    with _share_lock:
+        srv = _share_server
+    if srv is None:
+        return {"running": False}
+    host, port = srv.server_address[:2]
+    conf = srv.share_conf
+    return {"running": True, "host": host, "port": port,
+            "target_port": conf["target_port"], "keys": len(conf["keys"]),
+            "api_only": bool(conf.get("api_only", True))}
+
 # ── GUI（主线程）──
 def run_gui():
     import tkinter as tk
@@ -848,6 +1161,18 @@ def run_gui():
         _ph = proxy_host_var.get().strip()
         _pp = proxy_port_var.get().strip()
         u["proxy"] = f"{_ph}:{_pp}" if (_ph and _pp) else ""
+        try:
+            _s = cfg.setdefault("share", {})
+            _s["enabled"] = bool(share_on_var.get())
+            try:
+                _s["port"] = int(share_port_var.get().strip() or "8189")
+            except ValueError:
+                _s["port"] = 8189
+            _k = share_key_var.get().strip()
+            _s["keys"] = [_k] if _k else []
+            _s["api_only"] = bool(share_api_only_var.get())
+        except NameError:
+            pass
         save_config(cfg)
 
     _persist_job = {"id": None}
@@ -980,6 +1305,94 @@ def run_gui():
     _on_toggle_bg()
     refresh_preview()
 
+    # ── 分享 API：外部应用用「地址 + 密钥」调用 ComfyUI ──
+    share_cfg0 = share_config(cfg)
+    share_on_var = tk.BooleanVar(value=bool(share_cfg0.get("enabled")))
+    share_port_var = tk.StringVar(value=str(share_cfg0.get("port") or 8189))
+    share_api_only_var = tk.BooleanVar(value=bool(share_cfg0.get("api_only", True)))
+    share_key_var = tk.StringVar(value=(share_cfg0["keys"][0] if share_cfg0["keys"] else ""))
+
+    share_box = tk.LabelFrame(root, text=" 分享 API（给外部应用调用，URL 里带密钥） ",
+                              padx=8, pady=6, font=("Microsoft YaHei UI", 9))
+    share_box.pack(fill="x", padx=10, pady=4)
+    share_box.columnconfigure(2, weight=1)
+
+    tk.Checkbutton(share_box, text="启用", variable=share_on_var).grid(row=0, column=0, sticky="w", padx=4)
+    tk.Label(share_box, text="端口:").grid(row=0, column=1, sticky="e", padx=(8, 2))
+    tk.Entry(share_box, textvariable=share_port_var, width=8).grid(row=0, column=2, sticky="w")
+    tk.Checkbutton(share_box, text="只放行 API（不暴露网页界面与上传）",
+                   variable=share_api_only_var).grid(row=0, column=3, sticky="w", padx=8)
+
+    tk.Label(share_box, text="访问密钥:").grid(row=1, column=0, sticky="w", padx=4, pady=(4, 2))
+    tk.Entry(share_box, textvariable=share_key_var, width=46).grid(
+        row=1, column=1, columnspan=2, sticky="we", padx=4, pady=(4, 2))
+    key_btns = tk.Frame(share_box)
+    key_btns.grid(row=1, column=3, sticky="w", padx=8)
+
+    def _gen_share_key():
+        share_key_var.set(secrets.token_hex(16))
+        share_on_var.set(True)
+
+    def _copy_share_key():
+        k = share_key_var.get().strip()
+        if not k:
+            return
+        try:
+            root.clipboard_clear()
+            root.clipboard_append(k)
+            _append("INFO", "✓ 密钥已复制到剪贴板")
+        except Exception as e:
+            messagebox.showwarning("复制失败", str(e))
+
+    tk.Button(key_btns, text="生成", command=_gen_share_key, padx=6).pack(side="left")
+    tk.Button(key_btns, text="复制", command=_copy_share_key, padx=6).pack(side="left", padx=(4, 0))
+
+    share_url_var = tk.StringVar(value="")
+
+    def _refresh_share_url():
+        port = share_port_var.get().strip() or "8189"
+        key = share_key_var.get().strip() or "<KEY>"
+        api_only = "只放行 API" if share_api_only_var.get() else "全放行（含网页）"
+        share_url_var.set(f"外部调用示例： http://<你的穿透地址>:{port}/{key}/prompt    （{api_only}）")
+
+    apply_btn = tk.Button(share_box, text="应用（重启网关）", padx=10, pady=1)
+
+    def do_apply_share():
+        _persist_settings_now()
+        _refresh_share_url()
+
+        def _worker():
+            stop_share_gateway()
+            if share_on_var.get():
+                r = start_share_gateway(load_config())
+                msg = (f"✓ 分享网关已启动：端口 {r.get('port')}" if r.get("ok")
+                       else f"⚠ 分享网关启动失败：{r.get('error')}")
+            else:
+                msg = "分享网关已关闭"
+            ui_call(_append, "INFO", msg)
+
+        _run_in_thread(_worker)
+
+    apply_btn.config(command=do_apply_share)
+    apply_btn.grid(row=2, column=0, sticky="w", padx=4, pady=(4, 0))
+    share_status_lbl = tk.Label(share_box, text="", fg="#0a7d32", font=("Microsoft YaHei UI", 8))
+    share_status_lbl.grid(row=2, column=1, columnspan=3, sticky="w", padx=4, pady=(4, 0))
+    tk.Label(share_box, textvariable=share_url_var, fg="#888",
+             font=("Microsoft YaHei UI", 8)).grid(row=3, column=0, columnspan=4, sticky="w", padx=4)
+
+    for _v in (share_on_var, share_port_var, share_api_only_var, share_key_var):
+        _v.trace_add("write", schedule_persist)
+        _v.trace_add("write", lambda *_: _refresh_share_url())
+    _refresh_share_url()
+
+    def _refresh_share_status():
+        st = share_gateway_status()
+        share_status_lbl.config(
+            text=(f"运行中 → 127.0.0.1:{st.get('port')}  转发到 ComfyUI :{st.get('target_port')}"
+                  + ("   仅 API" if st.get("api_only") else "   全放行"))
+            if st.get("running") else "未运行（勾选启用后点「应用」）",
+            fg="#0a7d32" if st.get("running") else "#888")
+        root.after(2000, _refresh_share_status)
     # ── 日志区（双 tab：启动器/API 日志 + ComfyUI 日志）──
     log_frame = tk.LabelFrame(root, text=" 实时日志 ", padx=4, pady=4, font=("Microsoft YaHei UI", 9))
     log_frame.pack(fill="both", expand=True, padx=10, pady=4)
@@ -1466,6 +1879,10 @@ def run_gui():
 
     def _on_close():
         flush_comfy_log()
+        try:
+            stop_share_gateway()
+        except Exception:
+            pass
         if _persist_job["id"] is not None:
             try:
                 root.after_cancel(_persist_job["id"])
@@ -1479,6 +1896,7 @@ def run_gui():
     root.after(50, pump_ui)
     root.after(200, pump_logs)
     root.after(500, refresh_status)
+    root.after(600, _refresh_share_status)
     root.after(300, refresh_hint)
     _log("INFO", f"GUI 就绪，管理端口 {cfg['listen_port']}")
     root.mainloop()
@@ -1488,7 +1906,7 @@ def run_gui():
 # 更新机制（由壳 exe 调用；core.py 本身可被热替换）
 # ══════════════════════════════════════════════════════════════
 
-CORE_VERSION = "1.0.12"
+CORE_VERSION = "1.0.13"
 # 更新源：GitHub 直连 + 加速镜像列表 + 仓库地址。version.json 与 core.py 放仓库根目录。
 # 逻辑文件（version.json / core.py）：prefix + /<repo>/<branch>/<file>
 # Release 附件（exe）：prefix + /https://github.com/<repo>/releases/download/<tag>/<name>
@@ -2144,6 +2562,10 @@ def main():
     threading.Thread(target=exe_sha256, daemon=True).start()   # 预热本体哈希，别卡首帧 UI
     cfg = load_config()
     start_http_server(cfg)
+    if (cfg.get("share") or {}).get("enabled"):
+        _r = start_share_gateway(cfg)
+        if not _r.get("ok"):
+            _log("WARN", f"分享网关未启动: {_r.get('error')}")
     _log("INFO", f"启动器版本 {CORE_VERSION}，PID={os.getpid()}")
     # 可选：启动后自动拉起 ComfyUI（auto_start_comfyui=true 时）
     if cfg.get("auto_start_comfyui"):

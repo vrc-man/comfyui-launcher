@@ -1,8 +1,8 @@
 {
-  "version": "1.0.12",
-  "core_sha256": "0c449fb353a4b84f186cc765767aa756b242a931a3f5150a748f58d0cc7fa683",
-  "core_size": 91128,
-  "changelog": "修 UI 卡顿：日志面板每行 tag_config 导致 O(n²)（1500 行 23 秒），改为 tag 配置一次+批量插入（99k 行/秒，3000 行 1.13 秒渲染完）；ComfyUI 日志攒批落盘（3.7k -> 66k 行/秒）；日志自动滚动仅在贴底时生效；启动后台预热 exe 哈希",
+  "version": "1.0.13",
+  "core_sha256": "cea9631a81971ab6a16d11ec88b87929ea44ad751e95d5dd8b626b4ab41d2062",
+  "core_size": 108478,
+  "changelog": "新增分享网关：把 ComfyUI API 以「地址+密钥」暴露给外部应用（内网穿透），支持 URL 前缀与 X-Token、多个密钥、API 白名单、失败限速、日志脱敏、WS 透传；GUI 增加分享 API 配置区",
   "exe": {
     "sha256": "e7de34e698599102d80281041708196f400a91272285e1ed7cc9c57383812f4d",
     "size": 17949694,
